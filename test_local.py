@@ -1,6 +1,7 @@
 """
 Local verification script for RunPod Worker without running inside Docker.
 """
+import asyncio
 import base64
 import json
 import os
@@ -20,7 +21,7 @@ def run_local_test():
         job = json.load(f)
 
     print("[*] Invoking handler(job)...")
-    result = handler(job)
+    result = asyncio.run(handler(job))
 
     if "error" in result:
         print(f"[!] Worker returned error: {result['error']}")

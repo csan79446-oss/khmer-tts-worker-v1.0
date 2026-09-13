@@ -1,7 +1,8 @@
 """
-RunPod Serverless Handler for Khmer TTS / VoxCPM AI Engine.
+RunPod Serverless Async Handler for Khmer TTS / VoxCPM AI Engine.
 Complies with RunPod Serverless SDK v1.6+ specification.
 """
+import asyncio
 import base64
 import io
 import json
@@ -21,9 +22,9 @@ logger = logging.getLogger("KhmerTTSHandler")
 from model_engine import get_model_engine
 
 
-def handler(job: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    RunPod Serverless worker entry point.
+    RunPod Serverless async worker entry point.
     Receives incoming job with payload: {"input": {...}}
     Returns:
         {
@@ -72,8 +73,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         start_t = time.time()
         engine = get_model_engine()
 
-        # Synthesize audio
-        audio_array, sample_rate = engine.synthesize(
+        # Asynchronously synthesize audio
+        audio_array, sample_rate = await engine.synthesize(
             text=text,
             speed=speed,
             prompt=prompt,
@@ -123,7 +124,7 @@ if __name__ == "__main__":
         else:
             test_payload = {"input": {"text": "ជំរាបសួរ! នេះជាការសាកល្បង Khmer TTS។", "speed": 0.9}}
 
-        result = handler(test_payload)
+        result = asyncio.run(handler(test_payload))
         if "audio_base64" in result:
             out_wav = os.path.join(os.path.dirname(__file__), "test_output.wav")
             with open(out_wav, "wb") as f:
@@ -132,10 +133,10 @@ if __name__ == "__main__":
         else:
             logger.error(f"FAILED: {result}")
     else:
-        # Standard RunPod Serverless startup
+        # Standard RunPod Serverless startup (natively supports async handler)
         try:
             import runpod
-            logger.info("Starting RunPod Serverless worker loop...")
+            logger.info("Starting RunPod Serverless async worker loop...")
             runpod.serverless.start({"handler": handler})
         except ImportError:
             logger.error("runpod SDK is not installed. To test locally, run: python handler.py --test")

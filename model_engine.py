@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Tuple, Optional
 import numpy as np
 import soundfile as sf
-import scipy.signal
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s")
@@ -100,7 +99,7 @@ class KhmerTTSModelEngine:
 
         return audio_array, sr
 
-    def synthesize(
+    async def synthesize(
         self,
         text: str,
         speed: float = 1.0,
@@ -110,7 +109,7 @@ class KhmerTTSModelEngine:
         voice_ref_path: Optional[str] = None
     ) -> Tuple[np.ndarray, int]:
         """
-        Synthesizes Khmer speech waveform from normalized text.
+        Asynchronously synthesizes Khmer speech waveform from normalized text.
 
         Returns:
             Tuple[np.ndarray, int]: (audio_waveform_float32, sample_rate)
@@ -124,18 +123,7 @@ class KhmerTTSModelEngine:
         # 1. Primary: Neural Khmer Speech Generation (Authentic Human Voice)
         if HAS_EDGE_TTS:
             try:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_closed():
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
-                audio, sr = loop.run_until_complete(
-                    self._synthesize_neural_async(text, speed=speed, prompt=prompt)
-                )
+                audio, sr = await self._synthesize_neural_async(text, speed=speed, prompt=prompt)
 
                 # Peak normalize
                 peak = np.max(np.abs(audio))
