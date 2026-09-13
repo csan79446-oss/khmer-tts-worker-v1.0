@@ -7,6 +7,7 @@ import io
 import os
 import sys
 import logging
+import tempfile
 from pathlib import Path
 from typing import Tuple, Optional
 import numpy as np
@@ -28,6 +29,52 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+
+def _decode_mp3_buffer(mp3_buffer: io.BytesIO) -> Tuple[np.ndarray, int]:
+    """
+    Decode Edge-TTS MP3 bytes into mono float32 audio using the highest-quality
+    decoder available.
+
+    libsndfile's bundled MP3 decoder is a compact fixed-point decoder that adds
+    broadband decode noise — a contributor to the audible 'wooshing' heard in
+    downstream pipelines that amplify low-level content. When FFmpeg is available
+    (installed in the worker Docker image), we prefer the librosa/audioread path,
+    which uses FFmpeg's much higher-fidelity decoder. libsndfile is kept as a
+    safe fallback (still functional, slightly lower quality).
+
+    Returns:
+        (mono_float32_waveform, sample_rate)
+    """
+    mp3_buffer.seek(0)
+
+    # Path 1: high-fidelity FFmpeg decode via librosa/audioread (needs a temp file)
+    try:
+        import librosa
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp.write(mp3_buffer.read())
+                tmp_path = tmp.name
+            y, sr = librosa.load(tmp_path, sr=None, mono=True)
+            return y.astype(np.float32), int(sr)
+        except Exception as decode_ex:
+            logger.warning(f"High-fidelity MP3 decode failed ({decode_ex}); using libsndfile fallback.")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except ImportError:
+        logger.debug("librosa not available; using libsndfile MP3 decode.")
+
+    # Path 2: libsndfile fallback
+    mp3_buffer.seek(0)
+    y, sr = sf.read(mp3_buffer, dtype="float32")
+    if y.ndim > 1:
+        y = np.mean(y, axis=1)
+    return y.astype(np.float32), int(sr)
 
 
 class KhmerTTSModelEngine:
@@ -91,13 +138,9 @@ class KhmerTTSModelEngine:
             if chunk["type"] == "audio":
                 mp3_buffer.write(chunk["data"])
 
-        mp3_buffer.seek(0)
-        audio_array, sr = sf.read(mp3_buffer, dtype="float32")
-
-        if audio_array.ndim > 1:
-            audio_array = np.mean(audio_array, axis=1)
-
-        return audio_array, sr
+        # High-fidelity decode (FFmpeg preferred, libsndfile fallback)
+        audio_array, sr = _decode_mp3_buffer(mp3_buffer)
+        return np.clip(audio_array, -1.0, 1.0), sr
 
     async def synthesize(
         self,
@@ -125,10 +168,10 @@ class KhmerTTSModelEngine:
             try:
                 audio, sr = await self._synthesize_neural_async(text, speed=speed, prompt=prompt)
 
-                # Peak normalize
+                # Peak normalize (worker-side mild gain; app caps any further boost)
                 peak = np.max(np.abs(audio))
                 if peak > 0:
-                    audio = (audio / peak) * 0.92
+                    audio = np.clip((audio / peak) * 0.92, -1.0, 1.0)
 
                 logger.info(f"Neural Khmer speech generated successfully: duration={len(audio)/sr:.2f}s, sr={sr}Hz")
                 return audio.astype(np.float32), sr
