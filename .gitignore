@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Output & temp audio
+*.wav
+*.mp3
+*.flac
+*.ogg
+test_output.wav
+
+# Large model checkpoints (store on RunPod volume or HuggingFace)
+models/*
+!models/.gitkeep
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
