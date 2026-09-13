@@ -30,12 +30,22 @@ class KhmerTTSModelEngine:
     def __init__(self, model_dir: Optional[str] = None):
         self.model_dir = Path(model_dir or os.getenv("MODEL_PATH", "/workspace/models"))
         self.sample_rate = 24000  # 24 kHz high-fidelity studio standard
-        self.device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
         self.model_loaded = False
         self.custom_model = None
 
+        # Safely determine device (prevent crash if CUDA compute capability mismatch)
+        self.device = "cpu"
+        if HAS_TORCH and torch.cuda.is_available():
+            try:
+                torch.zeros(1, device="cuda")
+                self.device = "cuda"
+            except Exception as ce:
+                logger.warning(f"CUDA device test failed ({ce}). Falling back to CPU mode.")
+                self.device = "cpu"
+
         logger.info(f"Initializing Khmer TTS Engine on device: {self.device.upper()}")
         self._load_model()
+
 
     def _load_model(self):
         """Loads neural TTS weights if present on disk or via environment."""
