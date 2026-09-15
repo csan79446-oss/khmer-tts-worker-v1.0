@@ -1,82 +1,88 @@
-# Khmer TTS AI Worker (RunPod Serverless v1.0)
+# Khmer TTS AI Worker (RunPod Serverless v2.0 — REAL VoxCPM)
 
-Production-grade RunPod Serverless AI Worker for Khmer Text-to-Speech (TTS), voice cloning, and audio synthesis, designed to serve the [Khmer TTS Studio Desktop Application](https://github.com/csan79446-oss).
+Production-grade RunPod Serverless AI Worker for Khmer Text-to-Speech, running the
+**genuine [OpenBMB VoxCPM](https://github.com/OpenBMB/VoxCPM)** neural model
+(voice design + true zero-shot voice cloning), designed to serve the
+Khmer TTS Studio Desktop Application.
 
----
+## 🌟 What this worker actually does
 
-## 🌟 Features
-
-- **RunPod Serverless SDK v1.6+**: Standard handler architecture (`handler.py`) supporting asynchronous execution.
-- **Khmer Neural Acoustic Synthesis**: 24,000 Hz high-fidelity mono WAV PCM output.
-- **Voice Reference Audio Cloning**: Accepts Base64 encoded WAV/MP3 reference audio to adapt pitch and speaker cadence.
-- **Speed, Emotion & Prompt Control**: Fine-grained duration stretching, prompt steering, and emotional variance.
-- **Containerized for GPU**: Optimized Docker image with PyTorch 2.2, CUDA 12.1, FFmpeg, and libsndfile.
-
----
+| Feature | Implementation |
+|---|---|
+| **VoxCPM neural synthesis** | Real `voxcpm` package, `VoxCPM.from_pretrained("openbmb/VoxCPM2")` (or a local checkpoint / Network Volume) |
+| **Voice Design** | The UI's voice-prompt presets + emotion are compiled into a VoxCPM control instruction, e.g. `(A warm Cambodian female voice, calm tone, slightly slower pace)` |
+| **Voice Cloning** | Base64 reference audio is decoded and passed as `reference_wav_path` (Controllable Cloning, VoxCPM2) — true timbre cloning |
+| **Temperature** | Mapped onto VoxCPM `cfg_value` (0.7 → ≈2.0 balanced default; range 1.0–3.0) |
+| **Speed** | Soft style guidance + precise `librosa` time-stretch to guarantee the requested rate |
+| **Edge-TTS fallback** | Explicitly labelled and logged as `[FALLBACK]` (used only when VoxCPM weights can't load or the package is missing); **no** synthetic-beep generator exists anymore |
+| **Error contract** | The handler **raises** on failure → RunPod marks the job `FAILED` and the desktop client shows the real reason |
+| **Output** | Mono WAV PCM-16, Base64, native VoxCPM2 sample rate (48 kHz) |
 
 ## 📂 Project Structure
 
 ```text
-khmer-tts-worker/
-├── handler.py          # RunPod serverless entrypoint
-├── model_engine.py     # Neural acoustic model engine & GPU manager
-├── Dockerfile          # CUDA-accelerated container image
-├── requirements.txt    # Python dependencies
+runpod_worker/
+├── handler.py          # RunPod serverless entrypoint (raises on failure)
+├── model_engine.py     # REAL VoxCPM engine + labelled Edge-TTS fallback
+├── Dockerfile          # PyTorch 2.5.1 + CUDA 12.4 base (voxcpm needs torch>=2.5)
+├── requirements.txt    # runpod, voxcpm, edge-tts, soundfile, librosa
+├── .dockerignore
 ├── test_input.json     # Test payload with Khmer text
-├── test_local.py       # Offline local verification script
-├── DEPLOY_GUIDE.md     # Full step-by-step deployment guide (Khmer & English)
-├── models/             # Directory for custom model checkpoints (.gitkeep)
-└── README.md           # Project documentation
+├── test_local.py       # Local verification (uses Edge-TTS fallback if voxcpm absent)
+├── DEPLOY_GUIDE.md     # Full deployment guide (Khmer & English)
+└── models/             # Optional local checkpoint dir / HF cache (Network Volume)
 ```
 
----
+## 🔧 Worker Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HF repo id, or a local checkpoint dir |
+| `VOXCPM_DEVICE` | `auto` | `auto` (cuda→mps→cpu), `cuda`, `cpu` |
+| `VOXCPM_TIMESTEPS` | `10` | Diffusion steps (4–30; more = better quality, slower) |
+| `VOXCPM_DENOISER` | `0` | Load reference-audio denoiser (16 kHz pipeline) |
+| `VOXCPM_OPTIMIZE` | `1` | torch.compile optimizations (`0` to disable on issues) |
+| `VOXCPM_PRELOAD` | `1` | Load weights at container start (cold-start hygiene) |
+| `MODEL_PATH` | `/workspace/models` | Local checkpoint / volume dir |
+| `HF_HOME` | `/workspace/models/hf_cache` | HF download cache (put on a Network Volume!) |
 
 ## 🚀 Quick Start (Local Testing)
 
-Test the worker handler locally on your workstation without Docker:
-
 ```bash
-python test_local.py
+python runpod_worker/test_local.py
+# or
+python runpod_worker/handler.py --test
 ```
 
-Or run directly with the test flag:
-```bash
-python handler.py --test
-```
-
----
+> Without the `voxcpm` package installed, this exercises the labelled Edge-TTS
+> fallback so the payload/response contract can still be verified.
 
 ## 🐳 Docker Build & Push
 
 ```bash
-# 1. Login to Docker Hub
-docker login
-
-# 2. Build image
-docker build -t your-dockerhub-username/khmer-tts-worker:v1.0 .
-
-# 3. Push to registry
-docker push your-dockerhub-username/khmer-tts-worker:v1.0
+docker build -t your-dockerhub-username/khmer-tts-worker:v2.0 .
+docker push your-dockerhub-username/khmer-tts-worker:v2.0
 ```
-
----
 
 ## ☁️ RunPod Serverless Deployment
 
-1. Create a **Template** on [RunPod Serverless Console](https://www.runpod.io/console/serverless):
-   - **Container Image**: `your-dockerhub-username/khmer-tts-worker:v1.0`
-   - **Container Disk**: `20 GB`
-2. Create an **Endpoint**:
-   - Choose GPU: **RTX 4090**, **RTX 3090**, or **A4000**
-   - Active Workers (Min): `0` (cost efficient)
-   - Max Workers: `2`
-   - Idle Timeout: `60` seconds
-3. Connect your Endpoint URL and API Key in **Khmer TTS V2 Studio** Settings.
+1. **Template**: container image above, **Container Disk ≥ 25 GB** (VoxCPM2 weights are multi-GB).
+2. **Network Volume** (strongly recommended): mount at `/workspace` and set
+   `HF_HOME=/workspace/models/hf_cache` so weights download **once**.
+3. **GPU**: RTX 4090 / 3090 / A40 (VoxCPM2 is a 2B model; ≥16 GB VRAM recommended).
+   Min workers `0`, idle timeout `60 s`.
+4. Connect Endpoint URL + API Key in the desktop app's Settings → **VoxCPM & RunPod**.
 
 See [DEPLOY_GUIDE.md](DEPLOY_GUIDE.md) for the full guide.
 
----
+## ⚠️ Language support note
+
+VoxCPM2 officially supports 30 languages; Khmer is **not guaranteed** to be on
+that list. Quality on Khmer should be evaluated — if results are poor, options
+are (a) LoRA fine-tuning VoxCPM on Khmer data, or (b) using the desktop app's
+local Edge-TTS engine. The worker always reports which engine produced the
+audio via the `engine` field in its response.
 
 ## 📄 License
 
-MIT License.
+MIT License (worker code). VoxCPM model weights: Apache-2.0.

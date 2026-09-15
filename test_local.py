@@ -1,5 +1,8 @@
 """
 Local verification script for RunPod Worker without running inside Docker.
+
+Requires network access for the Edge-TTS fallback (the real VoxCPM engine is
+only active when the 'voxcpm' package and model weights are available).
 """
 import asyncio
 import base64
@@ -13,6 +16,7 @@ import soundfile as sf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from handler import handler
+from model_engine import TTSWorkerError
 
 def run_local_test():
     input_path = os.path.join(os.path.dirname(__file__), "test_input.json")
@@ -21,7 +25,11 @@ def run_local_test():
         job = json.load(f)
 
     print("[*] Invoking handler(job)...")
-    result = asyncio.run(handler(job))
+    try:
+        result = asyncio.run(handler(job))
+    except (TTSWorkerError, ValueError) as ex:
+        print(f"[!] Worker raised (job would be FAILED on RunPod): {ex}")
+        sys.exit(1)
 
     if "error" in result:
         print(f"[!] Worker returned error: {result['error']}")
@@ -35,6 +43,7 @@ def run_local_test():
     b64_audio = result["audio_base64"]
     raw_wav = base64.b64decode(b64_audio)
     print(f"[+] Audio decoded successfully! Size: {len(raw_wav):,} bytes")
+    print(f"[+] Engine used: {result.get('engine', 'unknown')}")
 
     with io.BytesIO(raw_wav) as bio:
         data, sr = sf.read(bio)

@@ -1,6 +1,10 @@
 """
 RunPod Serverless Async Handler for Khmer TTS / VoxCPM AI Engine.
 Complies with RunPod Serverless SDK v1.6+ specification.
+
+Error contract: this handler RAISES on failure so the RunPod job is marked
+FAILED with the real error message (surfaced by the desktop client). Success
+returns: {"audio_base64": ..., "sample_rate": ..., "duration": ..., "status": "success"}
 """
 import asyncio
 import base64
@@ -19,35 +23,48 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [Worker] %(message)s")
 logger = logging.getLogger("KhmerTTSHandler")
 
-from model_engine import get_model_engine
+from model_engine import get_model_engine, preload_model, TTSWorkerError
 
 
 async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     RunPod Serverless async worker entry point.
     Receives incoming job with payload: {"input": {...}}
+    Input fields:
+        text (required), speed, prompt, emotion, temperature,
+        voice_reference | reference_audio_base64 (Base64 WAV/MP3, optional)
     Returns:
         {
             "audio_base64": "<base64_encoded_wav>",
-            "sample_rate": 24000,
+            "sample_rate": 48000,
             "duration": 4.52,
-            "status": "success"
+            "status": "success",
+            "engine": "VoxCPM" | "Edge-TTS (fallback)"
         }
+    Raises:
+        ValueError / TTSWorkerError -> RunPod marks the job FAILED.
     """
     job_id = job.get("id", "unknown_job")
-    job_input = job.get("input", {})
+    job_input = job.get("input") or {}
 
     logger.info(f"Received job {job_id} | Input keys: {list(job_input.keys())}")
 
-    # Validate input
-    text = job_input.get("text", "").strip()
-    if not text:
-        return {"error": "Missing or empty 'text' in job input."}
+    if not isinstance(job_input, dict):
+        raise ValueError("Job 'input' must be a JSON object.")
 
-    speed = float(job_input.get("speed", 1.0))
+    # Validate input
+    text = str(job_input.get("text", "")).strip()
+    if not text:
+        raise ValueError("Missing or empty 'text' in job input.")
+
+    try:
+        speed = float(job_input.get("speed", 1.0))
+        temperature = float(job_input.get("temperature", 0.7))
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"Invalid numeric parameter: {ex}")
+
     prompt = job_input.get("prompt", None)
     emotion = job_input.get("emotion", None)
-    temperature = float(job_input.get("temperature", 0.7))
 
     # Check for voice cloning reference audio (Base64)
     ref_b64 = job_input.get("voice_reference") or job_input.get("reference_audio_base64")
@@ -73,19 +90,23 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         start_t = time.time()
         engine = get_model_engine()
 
-        # Asynchronously synthesize audio
+        # Asynchronously synthesize audio (raises TTSWorkerError on total failure)
         audio_array, sample_rate = await engine.synthesize(
             text=text,
             speed=speed,
             prompt=prompt,
             emotion=emotion,
             temperature=temperature,
-            voice_ref_path=temp_ref_path
+            voice_ref_path=temp_ref_path,
         )
 
         duration = len(audio_array) / float(sample_rate) if sample_rate > 0 else 0.0
         elapsed = time.time() - start_t
-        logger.info(f"Synthesis finished in {elapsed:.2f}s | Audio duration: {duration:.2f}s")
+        used_engine = "VoxCPM" if engine.model_loaded else "Edge-TTS (fallback)"
+        logger.info(
+            f"Synthesis finished in {elapsed:.2f}s | engine={used_engine} | "
+            f"Audio duration: {duration:.2f}s"
+        )
 
         # Encode generated PCM float32 array to 16-bit WAV PCM in memory
         bio = io.BytesIO()
@@ -97,12 +118,9 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "audio_base64": b64_output,
             "sample_rate": sample_rate,
             "duration": round(duration, 3),
-            "status": "success"
+            "status": "success",
+            "engine": used_engine,
         }
-
-    except Exception as exc:
-        logger.error(f"Error during TTS synthesis in job {job_id}: {exc}", exc_info=True)
-        return {"error": f"Synthesis error: {str(exc)}"}
 
     finally:
         # Clean up temporary voice reference file
@@ -129,7 +147,10 @@ if __name__ == "__main__":
             out_wav = os.path.join(os.path.dirname(__file__), "test_output.wav")
             with open(out_wav, "wb") as f:
                 f.write(base64.b64decode(result["audio_base64"]))
-            logger.info(f"SUCCESS: Generated {out_wav} (duration={result['duration']}s, sr={result['sample_rate']}Hz)")
+            logger.info(
+                f"SUCCESS: Generated {out_wav} (duration={result['duration']}s, "
+                f"sr={result['sample_rate']}Hz, engine={result.get('engine')})"
+            )
         else:
             logger.error(f"FAILED: {result}")
     else:
@@ -137,6 +158,8 @@ if __name__ == "__main__":
         try:
             import runpod
             logger.info("Starting RunPod Serverless async worker loop...")
+            # Warm the model before the first job arrives (cold-start hygiene).
+            preload_model()
             runpod.serverless.start({"handler": handler})
         except ImportError:
             logger.error("runpod SDK is not installed. To test locally, run: python handler.py --test")
