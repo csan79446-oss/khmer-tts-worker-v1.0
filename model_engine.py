@@ -24,6 +24,7 @@ Environment variables:
   MODEL_PATH         local checkpoint/volume directory (default: /workspace/models)
 """
 import asyncio
+import inspect
 import io
 import os
 import logging
@@ -149,6 +150,78 @@ def _split_text_for_voxcpm(text: str, max_chars: int = 350) -> List[str]:
     if current:
         segments.append(current)
     return segments or [text]
+
+
+def _accepted_generate_params(model) -> set:
+    """
+    VoxCPM.generate() is a thin *args/**kwargs wrapper, so its public
+    signature carries no parameter names; the real contract lives on the
+    internal _generate() (and historically on generate() in some releases).
+    Inspect both so unsupported kwargs can be dropped instead of crashing
+    (e.g. reference_wav_path on VoxCPM 1.x models).
+    """
+    names: set = set()
+    for fn in (getattr(model, "generate", None), getattr(model, "_generate", None)):
+        if fn is None:
+            continue
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            continue
+        for name, param in params.items():
+            if param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                names.add(name)
+    return names
+
+
+def _filter_generate_kwargs(kwargs: dict, accepted: set) -> dict:
+    """Drop generation params unsupported by the loaded VoxCPM version."""
+    if not accepted:
+        return kwargs
+    filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.warning(f"Dropped generation params unsupported by this VoxCPM version: {dropped}")
+    return filtered
+
+
+def _consume_generated(generated) -> np.ndarray:
+    """Flatten VoxCPM output (array, nested list, or generator) to 1-D float32."""
+    if isinstance(generated, np.ndarray):
+        return generated.astype(np.float32).ravel()
+    if hasattr(generated, "__iter__") and not isinstance(generated, (str, bytes, dict)):
+        # Generator / list of chunks (possibly ragged) -> concatenate chunks
+        chunks = []
+        for chunk in generated:
+            chunks.append(np.asarray(chunk, dtype=np.float32).reshape(-1))
+        if chunks:
+            return np.concatenate(chunks).astype(np.float32)
+        return np.array([], dtype=np.float32)
+    return np.asarray(generated, dtype=np.float32).reshape(-1)
+
+
+def _polish_audio(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """
+    Master the generated waveform: DC removal, 10 ms edge fades (removes
+    leading/trailing clicks), and peak normalization to -1 dBFS.
+    """
+    audio = np.asarray(audio, dtype=np.float32).ravel()
+    if audio.size == 0:
+        return audio
+    audio = audio - np.mean(audio)
+    fade = min(int(sample_rate * 0.01), len(audio) // 4)
+    if fade > 0:
+        audio[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        audio[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    peak = np.max(np.abs(audio))
+    if peak > 1e-4:
+        audio = audio * (10 ** (-1.0 / 20) / peak)
+    else:
+        # (Near-)silence: do not amplify float residue into full-scale noise
+        audio = np.zeros_like(audio)
+    return np.clip(audio, -1.0, 1.0)
+
+
 class KhmerTTSModelEngine:
     """
     Real VoxCPM model engine. Manages checkpoint loading, GPU memory
@@ -163,6 +236,10 @@ class KhmerTTSModelEngine:
         self.load_denoiser = _env_flag("VOXCPM_DENOISER", False)
         self.optimize = _env_flag("VOXCPM_OPTIMIZE", True)
         self.sample_rate = 48000  # VoxCPM2 native output; updated after model load
+        # VoxCPM2's LM has an 8192-token KV cache; long reference audios
+        # overflow it during prompt prefill, so cap how much prompt we keep.
+        self.max_reference_seconds = float(os.getenv("MAX_REFERENCE_AUDIO_SECONDS", "10"))
+        self.accepted_generate_kwargs: set = set()
 
         self.model = None
         self.model_loaded = False
@@ -218,9 +295,11 @@ class KhmerTTSModelEngine:
                     device=self.device,
                 )
             self.sample_rate = int(self.model.tts_model.sample_rate)
+            self.accepted_generate_kwargs = _accepted_generate_params(self.model)
             self.model_loaded = True
             logger.info(
-                f"VoxCPM model loaded successfully | native sample rate: {self.sample_rate} Hz"
+                f"VoxCPM model loaded successfully | native sample rate: {self.sample_rate} Hz | "
+                f"accepted generate params: {sorted(self.accepted_generate_kwargs) or 'unknown (*args/**kwargs)'}"
             )
         except Exception as ex:
             self.model = None
@@ -259,9 +338,13 @@ class KhmerTTSModelEngine:
                 # timbre; the parenthesized instruction steers style. No
                 # transcript of the reference is required (VoxCPM2).
                 kwargs["reference_wav_path"] = voice_ref_path
+            kwargs = _filter_generate_kwargs(kwargs, self.accepted_generate_kwargs)
             wav = self.model.generate(text=gen_text, **kwargs)
-            wavs.append(np.asarray(wav, dtype=np.float32).squeeze())
+            wavs.append(_consume_generated(wav))
 
+        wavs = [w for w in wavs if w.size > 0]
+        if not wavs:
+            raise TTSWorkerError("VoxCPM generation returned no audio.")
         audio = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
         audio = np.clip(audio, -1.0, 1.0)
 
@@ -272,6 +355,35 @@ class KhmerTTSModelEngine:
             audio = librosa.effects.time_stretch(audio, rate=float(speed))
 
         return audio, self.sample_rate
+
+    def _condition_reference_audio(self, ref_path: str) -> str:
+        """
+        Normalize the caller-supplied reference audio for VoxCPM cloning:
+        - load regardless of container format (wav / mp3 / ogg / m4a)
+        - convert to mono PCM16 WAV at the model's native sample rate
+        - trim to MAX_REFERENCE_AUDIO_SECONDS (VoxCPM2's 8192-token KV cache
+          overflows on long prompt prefill)
+        Returns the conditioned path, or the original path on failure.
+        """
+        if not HAS_LIBROSA:
+            return ref_path
+        try:
+            import tempfile
+            y, _sr = librosa.load(ref_path, sr=self.sample_rate, mono=True)
+            max_samples = int(self.max_reference_seconds * self.sample_rate)
+            if len(y) > max_samples:
+                y = y[:max_samples]
+                logger.info(f"Reference audio trimmed to {self.max_reference_seconds}s")
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp.name, y, self.sample_rate, subtype="PCM_16")
+            tmp.close()
+            logger.info(
+                f"Reference audio conditioned: {len(y) / self.sample_rate:.2f}s @ {self.sample_rate}Hz"
+            )
+            return tmp.name
+        except Exception as ex:
+            logger.warning(f"Reference audio conditioning failed ({ex}); using original file.")
+            return ref_path
 
     async def _synthesize_edge_fallback(
         self,
@@ -325,6 +437,15 @@ class KhmerTTSModelEngine:
 
         speed = max(0.5, min(2.0, float(speed)))
 
+        # Condition the voice reference (format-agnostic load, mono PCM16 at
+        # the model rate, trimmed to avoid KV-cache overflow on long prompts).
+        ref_path = voice_ref_path
+        conditioned_ref = None
+        if self.model_loaded and self.model is not None and voice_ref_path:
+            ref_path = self._condition_reference_audio(voice_ref_path)
+            if ref_path != voice_ref_path:
+                conditioned_ref = ref_path
+
         # 1. Primary: REAL VoxCPM neural generation (GPU/CPU, voice cloning)
         if self.model_loaded and self.model is not None:
             style = _build_style_instruction(prompt, emotion, speed)
@@ -332,7 +453,7 @@ class KhmerTTSModelEngine:
 
             try:
                 audio, sr = await asyncio.to_thread(
-                    self._generate_voxcpm, text, speed, style, cfg_value, voice_ref_path
+                    self._generate_voxcpm, text, speed, style, cfg_value, ref_path
                 )
             except Exception as ex:
                 logger.error(f"VoxCPM synthesis failed: {ex}", exc_info=True)
@@ -352,13 +473,22 @@ class KhmerTTSModelEngine:
             if audio is not None:
                 logger.info(
                     f"VoxCPM synthesis OK | cfg={cfg_value} | timesteps={self.inference_timesteps} | "
-                    f"ref_audio={'yes' if voice_ref_path else 'no'} | duration={len(audio)/sr:.2f}s"
+                    f"ref_audio={'yes' if ref_path else 'no'} | duration={len(audio)/sr:.2f}s"
                 )
-                # Mild peak normalization (app caps any further boost)
-                peak = np.max(np.abs(audio))
-                if peak > 0:
-                    audio = np.clip((audio / peak) * 0.92, -1.0, 1.0)
+                # Mastering: DC removal, edge fades, peak normalize to -1 dBFS
+                audio = _polish_audio(audio, sr)
+                if conditioned_ref:
+                    try:
+                        os.remove(conditioned_ref)
+                    except OSError:
+                        pass
                 return audio.astype(np.float32), sr
+
+            if conditioned_ref:
+                try:
+                    os.remove(conditioned_ref)
+                except OSError:
+                    pass
 
         # 2. Explicitly-labelled Edge-TTS fallback
         if HAS_EDGE_TTS:

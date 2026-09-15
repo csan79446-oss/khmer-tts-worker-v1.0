@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -24,6 +25,16 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [W
 logger = logging.getLogger("KhmerTTSHandler")
 
 from model_engine import get_model_engine, preload_model, TTSWorkerError
+
+
+def normalize_khmer_text(text: str) -> str:
+    """NFC normalize, strip zero-width/invisible characters, collapse whitespace."""
+    import unicodedata
+    text = unicodedata.normalize("NFC", text)
+    zero_width = "\u200b\u200c\u200d\u200e\u200f\ufeff\u00ad"
+    text = "".join(ch for ch in text if ch not in zero_width)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,8 +63,8 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(job_input, dict):
         raise ValueError("Job 'input' must be a JSON object.")
 
-    # Validate input
-    text = str(job_input.get("text", "")).strip()
+    # Validate input (NFC normalize + strip invisible characters)
+    text = normalize_khmer_text(str(job_input.get("text", "")))
     if not text:
         raise ValueError("Missing or empty 'text' in job input.")
 

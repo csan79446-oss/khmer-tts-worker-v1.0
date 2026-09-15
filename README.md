@@ -42,6 +42,7 @@ runpod_worker/
 | `VOXCPM_TIMESTEPS` | `10` | Diffusion steps (4–30; more = better quality, slower) |
 | `VOXCPM_DENOISER` | `0` | Load reference-audio denoiser (16 kHz pipeline) |
 | `VOXCPM_OPTIMIZE` | `1` | torch.compile optimizations (`0` to disable on issues) |
+| `MAX_REFERENCE_AUDIO_SECONDS` | `10` | Trim voice-clone reference audio (VoxCPM2's 8192-token KV cache overflows on long prompt prefill) |
 | `VOXCPM_PRELOAD` | `1` | Load weights at container start (cold-start hygiene) |
 | `MODEL_PATH` | `/workspace/models` | Local checkpoint / volume dir |
 | `HF_HOME` | `/workspace/models/hf_cache` | HF download cache (put on a Network Volume!) |
