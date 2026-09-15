@@ -185,6 +185,63 @@ def _filter_generate_kwargs(kwargs: dict, accepted: set) -> dict:
     return filtered
 
 
+def build_pretrained_kwargs(voxcpm_cls, load_denoiser: bool, optimize: bool, device: str):
+    """
+    Build the from_pretrained() kwargs the INSTALLED voxcpm release supports.
+
+    The PyPI 'voxcpm' package (1.x) has:
+        from_pretrained(model_id, zip_enhanced_conformer=True, optimize_bn=True, load_denoiser=True)
+    and does NOT accept 'device' or 'optimize'. Passing unknown kwargs raises
+    TypeError only AFTER the multi-GB weights have been downloaded. Newer
+    releases accept 'device' and 'optimize' directly. Returns
+    (kwargs, is_legacy_api).
+    """
+    import inspect
+
+    def _sig_info(fn):
+        if fn is None:
+            return None
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return None
+        names = {
+            n for n, p in sig.parameters.items()
+            if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        }
+        has_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        return names, has_varkw
+
+    infos = [
+        _sig_info(getattr(voxcpm_cls, "from_pretrained", None)),
+        _sig_info(getattr(voxcpm_cls, "__init__", None)),
+    ]
+
+    def accepts(name: str) -> bool:
+        for info in infos:
+            if info is None:
+                return True  # signature unknown -> optimistically pass through
+            names, has_varkw = info
+            if has_varkw or name in names:
+                return True
+        return False
+
+    kwargs = {}
+    if accepts("load_denoiser"):
+        kwargs["load_denoiser"] = load_denoiser
+    if accepts("optimize"):
+        kwargs["optimize"] = optimize
+    elif accepts("optimize_bn"):
+        kwargs["optimize_bn"] = optimize
+    if device and device != "auto" and accepts("device"):
+        kwargs["device"] = device
+
+    is_legacy = not (accepts("optimize") or accepts("device"))
+    return kwargs, is_legacy
+
+
 def _consume_generated(generated) -> np.ndarray:
     """Flatten VoxCPM output (array, nested list, or generator) to 1-D float32."""
     if isinstance(generated, np.ndarray):
@@ -236,6 +293,7 @@ class KhmerTTSModelEngine:
         self.load_denoiser = _env_flag("VOXCPM_DENOISER", False)
         self.optimize = _env_flag("VOXCPM_OPTIMIZE", True)
         self.sample_rate = 48000  # VoxCPM2 native output; updated after model load
+        self._legacy_api = False  # True when the installed voxcpm is the 1.x API
         # VoxCPM2's LM has an 8192-token KV cache; long reference audios
         # overflow it during prompt prefill, so cap how much prompt we keep.
         self.max_reference_seconds = float(os.getenv("MAX_REFERENCE_AUDIO_SECONDS", "10"))
@@ -277,28 +335,48 @@ class KhmerTTSModelEngine:
             f"denoiser={self.load_denoiser} | optimize={self.optimize} | timesteps={self.inference_timesteps}"
         )
         try:
+            # Version compatibility: introspect the installed voxcpm package
+            # and pass only supported kwargs (PyPI 1.x rejects device/optimize
+            # AFTER the weights download - fatal on serverless cold starts).
+            pretrained_kwargs, self._legacy_api = build_pretrained_kwargs(
+                VoxCPM, self.load_denoiser, self.optimize, self.device
+            )
+
+            model_id = self.model_id
+            if self._legacy_api and model_id.rstrip("/").endswith("VoxCPM2"):
+                # The 1.x package cannot run VoxCPM2 weights - fall back.
+                model_id = "openbmb/VoxCPM-0.5B"
+                logger.warning(
+                    "Installed 'voxcpm' package is the 1.x API (no device/optimize "
+                    "support), which cannot load VoxCPM2 weights. Automatically "
+                    f"switching model to {model_id}."
+                )
+
             local_checkpoint = self._resolve_local_checkpoint()
             if local_checkpoint:
                 logger.info(f"Using local VoxCPM checkpoint: {local_checkpoint}")
-                self.model = VoxCPM.from_pretrained(
-                    str(local_checkpoint),
-                    load_denoiser=self.load_denoiser,
-                    optimize=self.optimize,
-                    device=self.device,
-                )
+                self.model = VoxCPM.from_pretrained(str(local_checkpoint), **pretrained_kwargs)
             else:
-                logger.info("No local checkpoint found; downloading/loading from HuggingFace Hub...")
-                self.model = VoxCPM.from_pretrained(
-                    self.model_id,
-                    load_denoiser=self.load_denoiser,
-                    optimize=self.optimize,
-                    device=self.device,
+                logger.info(
+                    f"No local checkpoint found; downloading/loading from HuggingFace Hub "
+                    f"(id={model_id}, kwargs={sorted(pretrained_kwargs) or '(defaults)'})..."
                 )
-            self.sample_rate = int(self.model.tts_model.sample_rate)
+                self.model = VoxCPM.from_pretrained(model_id, **pretrained_kwargs)
+
+            # Safe sample-rate detection across package versions.
+            tts_model = getattr(self.model, "tts_model", None)
+            detected_sr = getattr(tts_model, "sample_rate", None) if tts_model is not None else None
+            if detected_sr:
+                self.sample_rate = int(detected_sr)
+            elif self._legacy_api:
+                self.sample_rate = 16000  # VoxCPM 0.5B native output rate
+                logger.warning("Could not detect sample rate; assuming 16000 Hz for legacy VoxCPM 1.x.")
+
             self.accepted_generate_kwargs = _accepted_generate_params(self.model)
             self.model_loaded = True
             logger.info(
                 f"VoxCPM model loaded successfully | native sample rate: {self.sample_rate} Hz | "
+                f"legacy_api={self._legacy_api} | "
                 f"accepted generate params: {sorted(self.accepted_generate_kwargs) or 'unknown (*args/**kwargs)'}"
             )
         except Exception as ex:
@@ -324,6 +402,7 @@ class KhmerTTSModelEngine:
             logger.info(f"VoxCPM: splitting long text into {len(segments)} segment(s)")
 
         wavs = []
+        ref_supported = voice_ref_path is not None
         for seg in segments:
             # Voice-Design / Controllable-Cloning control instruction is
             # prepended in parentheses before the target text.
@@ -333,13 +412,37 @@ class KhmerTTSModelEngine:
                 inference_timesteps=self.inference_timesteps,
                 retry_badcase=True,
             )
-            if voice_ref_path:
+            if ref_supported:
                 # Controllable Voice Cloning: reference_wav_path supplies the
                 # timbre; the parenthesized instruction steers style. No
                 # transcript of the reference is required (VoxCPM2).
                 kwargs["reference_wav_path"] = voice_ref_path
             kwargs = _filter_generate_kwargs(kwargs, self.accepted_generate_kwargs)
-            wav = self.model.generate(text=gen_text, **kwargs)
+
+            # Shrink-and-retry: some voxcpm releases wrap generate(*args,
+            # **kwargs) so signature introspection cannot see the real
+            # contract. If the runtime rejects a kwarg, drop it and retry.
+            while True:
+                try:
+                    wav = self.model.generate(text=gen_text, **kwargs)
+                    break
+                except TypeError as ex:
+                    m = re.search(r"unexpected keyword argument '(\w+)'", str(ex))
+                    if not m or m.group(1) not in kwargs:
+                        raise
+                    dropped = m.group(1)
+                    kwargs.pop(dropped)
+                    if dropped == "reference_wav_path":
+                        ref_supported = False
+                        logger.warning(
+                            "This voxcpm version does not support reference_wav_path "
+                            "- voice cloning is unavailable; continuing without cloning."
+                        )
+                    else:
+                        logger.warning(
+                            f"Dropped generation param '{dropped}' unsupported by this voxcpm version"
+                        )
+
             wavs.append(_consume_generated(wav))
 
         wavs = [w for w in wavs if w.size > 0]

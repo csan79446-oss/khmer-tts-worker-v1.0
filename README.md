@@ -37,7 +37,7 @@ runpod_worker/
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HF repo id, or a local checkpoint dir |
+| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HF repo id, or a local checkpoint dir. **Auto-fallback:** if the installed `voxcpm` package is the 1.x API, the worker automatically switches to `openbmb/VoxCPM-0.5B` |
 | `VOXCPM_DEVICE` | `auto` | `auto` (cuda→mps→cpu), `cuda`, `cpu` |
 | `VOXCPM_TIMESTEPS` | `10` | Diffusion steps (4–30; more = better quality, slower) |
 | `VOXCPM_DENOISER` | `0` | Load reference-audio denoiser (16 kHz pipeline) |
