@@ -362,6 +362,28 @@ def _pretrained_load_with_retry(voxcpm_cls, model_id: str, kwargs: dict):
                 raise
 
 
+def _looks_like_compile_error(ex: Exception) -> bool:
+    """
+    Detect torch.compile / torch._inductor / torch._dynamo failures. The
+    'optimize' path compiles graphs with the inductor backend, which needs a
+    C/C++ compiler (gcc/g++) inside the container; without one the model load
+    fails at runtime. Such failures are configuration-transient: retrying in
+    eager mode (optimizations disabled) loads the model with identical
+    synthesis quality, only slower warm-up.
+    """
+    msg = str(ex).lower()
+    markers = (
+        "failed to find c compiler",
+        "specify via cc environment variable",
+        "backend='inductor'",
+        "inductor raised",
+        "torch._dynamo",
+        "torch dynamo",
+        "triton",
+    )
+    return any(marker in msg for marker in markers)
+
+
 def _consume_generated(generated) -> np.ndarray:
     """Flatten VoxCPM output (array, nested list, or generator) to 1-D float32."""
     if isinstance(generated, np.ndarray):
@@ -482,69 +504,103 @@ class KhmerTTSModelEngine:
             f"denoiser={self.load_denoiser} | optimize={self.optimize} | timesteps={self.inference_timesteps}"
         )
         try:
-            # Version compatibility: introspect the installed voxcpm package
-            # and pass only supported kwargs (PyPI 1.x rejects device/optimize
-            # AFTER the weights download - fatal on serverless cold starts).
-            pretrained_kwargs, self._legacy_api = build_pretrained_kwargs(
-                VoxCPM, self.load_denoiser, self.optimize, self.device
-            )
+            self._load_model_once(self.optimize)
+            return
+        except Exception as primary_ex:
+            if not self.optimize or not _looks_like_compile_error(primary_ex):
+                self.model = None
+                self.model_loaded = False
+                logger.error(f"Failed to load VoxCPM model: {primary_ex}", exc_info=True)
+                raise TTSWorkerError(f"VoxCPM model failed to load: {primary_ex}")
 
-            model_id = self.model_id
-            if self._legacy_api and _is_voxcpm2_family(model_id):
-                # The 1.x package cannot run VoxCPM2 weights - fall back.
-                # (Catches 'openbmb/VoxCPM2', mirrors like 'Tha456/VoxCPM2',
-                # and variants such as 'voxcpm-2' / 'VoxCPM2-1.5B'.)
-                model_id = "openbmb/VoxCPM-0.5B"
+            # torch.compile (inductor) failed - typically a missing C/C++
+            # compiler in the container. Retry in eager mode: identical
+            # synthesis quality, slower warm-up, but the model LOADS and
+            # jobs succeed instead of failing.
+            logger.warning(
+                "Model load failed inside torch.compile/inductor "
+                f"({type(primary_ex).__name__}: {str(primary_ex)[:200]}). "
+                "Retrying with optimizations disabled (eager mode)..."
+            )
+            try:
+                self._load_model_once(False)
+                self.optimize = False  # reflect what is actually running
                 logger.warning(
-                    "Installed 'voxcpm' package is the 1.x API (no device/optimize "
-                    "support), which cannot load VoxCPM2 weights. Automatically "
-                    f"switching model to {model_id}."
+                    "VoxCPM loaded WITHOUT torch.compile optimizations (eager "
+                    "mode). For full optimization, install a C/C++ toolchain "
+                    "(e.g. 'build-essential') in the container image."
                 )
-            self.effective_model_id = model_id
-
-            local_checkpoint = self._resolve_local_checkpoint()
-            if local_checkpoint:
-                logger.info(f"Using local VoxCPM checkpoint: {local_checkpoint}")
-                self.model, pretrained_kwargs = _pretrained_load_with_retry(
-                    VoxCPM, str(local_checkpoint), pretrained_kwargs
+            except Exception as fallback_ex:
+                self.model = None
+                self.model_loaded = False
+                logger.error(
+                    f"Failed to load VoxCPM model (eager retry): {fallback_ex}",
+                    exc_info=True,
                 )
-            else:
-                logger.info(
-                    f"No local checkpoint found; downloading/loading from HuggingFace Hub "
-                    f"(id={model_id}, kwargs={sorted(pretrained_kwargs) or '(defaults)'})..."
-                )
-                self.model, pretrained_kwargs = _pretrained_load_with_retry(
-                    VoxCPM, model_id, pretrained_kwargs
-                )
+                raise TTSWorkerError(
+                    f"VoxCPM model failed to load (also without optimizations): {fallback_ex}"
+                ) from fallback_ex
 
-            # Ensure model is on target device if from_pretrained didn't place it
-            if self.device == "cuda" and hasattr(self.model, "to"):
-                try:
-                    self.model.to("cuda")
-                except Exception as ex:
-                    logger.debug(f"Model .to('cuda') check: {ex}")
+    def _load_model_once(self, optimize: bool) -> None:
+        """Single load attempt. Raises on failure; the caller decides retries."""
+        # Version compatibility: introspect the installed voxcpm package
+        # and pass only supported kwargs (PyPI 1.x rejects device/optimize
+        # AFTER the weights download - fatal on serverless cold starts).
+        pretrained_kwargs, self._legacy_api = build_pretrained_kwargs(
+            VoxCPM, self.load_denoiser, optimize, self.device
+        )
 
-            # Safe sample-rate detection across package versions.
-            tts_model = getattr(self.model, "tts_model", None)
-            detected_sr = getattr(tts_model, "sample_rate", None) if tts_model is not None else None
-            if detected_sr:
-                self.sample_rate = int(detected_sr)
-            elif self._legacy_api:
-                self.sample_rate = 16000  # VoxCPM 0.5B native output rate
-                logger.warning("Could not detect sample rate; assuming 16000 Hz for legacy VoxCPM 1.x.")
-
-            self.accepted_generate_kwargs = _accepted_generate_params(self.model)
-            self.model_loaded = True
-            logger.info(
-                f"VoxCPM model loaded successfully | native sample rate: {self.sample_rate} Hz | "
-                f"legacy_api={self._legacy_api} | "
-                f"accepted generate params: {sorted(self.accepted_generate_kwargs) or 'unknown (*args/**kwargs)'}"
+        model_id = self.model_id
+        if self._legacy_api and _is_voxcpm2_family(model_id):
+            # The 1.x package cannot run VoxCPM2 weights - fall back.
+            # (Catches 'openbmb/VoxCPM2', mirrors like 'Tha456/VoxCPM2',
+            # and variants such as 'voxcpm-2' / 'VoxCPM2-1.5B'.)
+            model_id = "openbmb/VoxCPM-0.5B"
+            logger.warning(
+                "Installed 'voxcpm' package is the 1.x API (no device/optimize "
+                "support), which cannot load VoxCPM2 weights. Automatically "
+                f"switching model to {model_id}."
             )
-        except Exception as ex:
-            self.model = None
-            self.model_loaded = False
-            logger.error(f"Failed to load VoxCPM model: {ex}", exc_info=True)
-            raise TTSWorkerError(f"VoxCPM model failed to load: {ex}")
+        self.effective_model_id = model_id
+
+        local_checkpoint = self._resolve_local_checkpoint()
+        if local_checkpoint:
+            logger.info(f"Using local VoxCPM checkpoint: {local_checkpoint}")
+            self.model, pretrained_kwargs = _pretrained_load_with_retry(
+                VoxCPM, str(local_checkpoint), pretrained_kwargs
+            )
+        else:
+            logger.info(
+                f"No local checkpoint found; downloading/loading from HuggingFace Hub "
+                f"(id={model_id}, kwargs={sorted(pretrained_kwargs) or '(defaults)'})..."
+            )
+            self.model, pretrained_kwargs = _pretrained_load_with_retry(
+                VoxCPM, model_id, pretrained_kwargs
+            )
+
+        # Ensure model is on target device if from_pretrained didn't place it
+        if self.device == "cuda" and hasattr(self.model, "to"):
+            try:
+                self.model.to("cuda")
+            except Exception as ex:
+                logger.debug(f"Model .to('cuda') check: {ex}")
+
+        # Safe sample-rate detection across package versions.
+        tts_model = getattr(self.model, "tts_model", None)
+        detected_sr = getattr(tts_model, "sample_rate", None) if tts_model is not None else None
+        if detected_sr:
+            self.sample_rate = int(detected_sr)
+        elif self._legacy_api:
+            self.sample_rate = 16000  # VoxCPM 0.5B native output rate
+            logger.warning("Could not detect sample rate; assuming 16000 Hz for legacy VoxCPM 1.x.")
+
+        self.accepted_generate_kwargs = _accepted_generate_params(self.model)
+        self.model_loaded = True
+        logger.info(
+            f"VoxCPM model loaded successfully | native sample rate: {self.sample_rate} Hz | "
+            f"legacy_api={self._legacy_api} | "
+            f"accepted generate params: {sorted(self.accepted_generate_kwargs) or 'unknown (*args/**kwargs)'}"
+        )
 
     # ------------------------------------------------------------------
     # Synthesis paths

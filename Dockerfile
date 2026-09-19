@@ -8,12 +8,16 @@ WORKDIR /app
 
 # System dependencies (audio codecs, ffmpeg, libsndfile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ffmpeg \
     libsndfile1 \
     libsndfile1-dev \
     git \
     curl \
     && rm -rf /var/lib/apt/lists/*
+# build-essential: gcc/g++ required by torch._inductor when VOXCPM_OPTIMIZE=1
+# (torch.compile compiles generated C/C++ code; without a compiler the model
+# load fails with "Failed to find C compiler").
 
 # VoxCPM weight cache & volume mount defaults.
 # By default we support /workspace or /runpod-volume (RunPod default).
