@@ -161,18 +161,24 @@ def _build_style_instruction(
     prompt: Optional[str],
     emotion: Optional[str],
     speed: float,
+    include_voice_design: bool = True,
 ) -> str:
     """
     Build a VoxCPM2 Voice-Design / Controllable-Cloning control instruction.
     The instruction is prepended to the text inside parentheses, e.g.
     "(warm female voice, calm tone, slightly slower pace)".
+
+    include_voice_design=False (clone mode) keeps only delivery hints such as
+    emotion and pacing: the timbre comes from the reference audio, and a long
+    voice-design description would FIGHT the cloned voice (the model follows
+    the instruction instead of the reference).
     """
     parts: List[str] = []
 
     prompt_text = (prompt or "").strip()
     # The desktop app's prompt presets are long descriptive sentences; they
     # work verbatim as a design instruction. Only hard-cap absurd lengths.
-    if prompt_text:
+    if include_voice_design and prompt_text:
         parts.append(prompt_text[:300])
 
     emotion_text = (emotion or "").strip()
@@ -605,49 +611,90 @@ class KhmerTTSModelEngine:
     # ------------------------------------------------------------------
     # Synthesis paths
     # ------------------------------------------------------------------
+    def _resolve_clone_params(
+        self,
+        ref_path: Optional[str],
+        ref_text: Optional[str],
+    ) -> dict:
+        """
+        Decide how (and whether) the caller's reference audio can actually be
+        used for voice cloning with the loaded voxcpm build/model, returning
+        the generate() kwargs that enable cloning ({} = cannot clone).
+
+        Official API contract (OpenBMB/VoxCPM core.py):
+          - reference_wav_path: VoxCPM2-only TRUE zero-shot cloning; can be
+            used ALONE - no transcript needed.
+          - prompt_wav_path + prompt_text: continuation cloning; the API
+            validates that BOTH are provided together or both are None
+            (a wav alone raises "prompt_wav_path and prompt_text must both
+            be provided or both be None").
+        """
+        if not ref_path:
+            return {}
+        accepted = self.accepted_generate_kwargs
+        if not accepted:
+            # Introspection-blind build (thin *args/**kwargs wrapper):
+            # optimistically request VoxCPM2-style true cloning; the
+            # generate-time shrink-and-retry drops/remaps rejected params.
+            return {"reference_wav_path": ref_path}
+        if "reference_wav_path" in accepted:
+            return {"reference_wav_path": ref_path}
+        if "prompt_wav_path" in accepted and (ref_text or "").strip():
+            return {"prompt_wav_path": ref_path, "prompt_text": ref_text.strip()}
+        logger.warning(
+            "Voice reference received but cannot be used by this voxcpm build/model "
+            "(reference_wav_path requires a VoxCPM2-capable build; legacy prompt "
+            "cloning additionally requires the reference transcript). "
+            "Synthesizing WITHOUT voice cloning."
+        )
+        return {}
+
     def _generate_voxcpm(
         self,
         text: str,
         speed: float,
         style_instruction: str,
         cfg_value: float,
-        voice_ref_path: Optional[str],
+        clone_params: Optional[dict] = None,
     ) -> Tuple[np.ndarray, int, bool]:
         """
         Real VoxCPM neural generation (blocking; run in a worker thread).
 
-        Returns (audio, sample_rate, voice_cloning_applied). The cloning flag is
-        True only if the reference audio was actually forwarded to the model -
-        some voxcpm releases silently reject reference/prompt params, in which
-        case generation continues WITHOUT cloning and the caller must not claim
-        otherwise.
+        clone_params carries the voice-cloning kwargs decided by
+        _resolve_clone_params(); {} means no cloning.
+
+        Returns (audio, sample_rate, voice_cloning_applied). The cloning flag
+        is True only if the reference audio was ACTUALLY forwarded to the
+        model and survived runtime retries - never guessed.
         """
         segments = _split_text_for_voxcpm(text)
         if len(segments) > 1:
             logger.info(f"VoxCPM: splitting long text into {len(segments)} segment(s)")
 
         wavs = []
-        ref_supported = voice_ref_path is not None
-        ref_param = "reference_wav_path"
-        if ref_supported:
-            if "prompt_wav_path" in self.accepted_generate_kwargs and "reference_wav_path" not in self.accepted_generate_kwargs:
-                ref_param = "prompt_wav_path"
-            else:
-                ref_param = "reference_wav_path"
+        # Mutable clone state shared across segments: a param dropped in a
+        # runtime retry must not reappear in later segments, and a param the
+        # runtime already rejected must never be re-added (no ping-pong).
+        active_clone_params = dict(clone_params or {})
+        rejected_ref_params: set = set()
+        ref_source_path = active_clone_params.get("reference_wav_path") or active_clone_params.get("prompt_wav_path")
+        ref_source_text = active_clone_params.get("prompt_text")
 
         for seg in segments:
             # Voice-Design / Controllable-Cloning control instruction is
-            # prepended in parentheses before the target text.
+            # prepended in parentheses before the target text. In clone mode
+            # the caller already stripped the voice-design description
+            # (delivery hints only), so it cannot fight the reference timbre.
             gen_text = f"({style_instruction}){seg}" if style_instruction else seg
             kwargs = dict(
                 cfg_value=cfg_value,
                 inference_timesteps=self.inference_timesteps,
                 retry_badcase=True,
             )
-            if ref_supported:
-                # Controllable Voice Cloning: reference_wav_path / prompt_wav_path
-                # supplies the timbre; the parenthesized instruction steers style.
-                kwargs[ref_param] = voice_ref_path
+            if active_clone_params:
+                # Controllable Voice Cloning: reference/prompt audio supplies
+                # the timbre; the parenthesized instruction steers delivery.
+                kwargs.update(active_clone_params)
             kwargs = _filter_generate_kwargs(kwargs, self.accepted_generate_kwargs)
 
             # Shrink-and-retry: some voxcpm releases wrap generate(*args,
@@ -663,14 +710,22 @@ class KhmerTTSModelEngine:
                         raise
                     dropped = m.group(1)
                     kwargs.pop(dropped)
-                    if dropped in ("reference_wav_path", "prompt_wav_path"):
+                    active_clone_params.pop(dropped, None)
+                    if dropped in ("reference_wav_path", "prompt_wav_path") and ref_source_path:
+                        rejected_ref_params.add(dropped)
                         alt_param = "prompt_wav_path" if dropped == "reference_wav_path" else "reference_wav_path"
-                        if alt_param not in kwargs and voice_ref_path and ref_supported:
+                        if alt_param not in kwargs and alt_param not in rejected_ref_params:
                             logger.info(f"Retrying with alternative voice reference param '{alt_param}'...")
-                            ref_param = alt_param
-                            kwargs[alt_param] = voice_ref_path
+                            kwargs[alt_param] = ref_source_path
+                            active_clone_params[alt_param] = ref_source_path
+                            # The legacy prompt pair REQUIRES the transcript too
+                            if alt_param == "prompt_wav_path" and ref_source_text:
+                                kwargs["prompt_text"] = ref_source_text
+                                active_clone_params["prompt_text"] = ref_source_text
                         else:
-                            ref_supported = False
+                            active_clone_params.pop("prompt_wav_path", None)
+                            active_clone_params.pop("reference_wav_path", None)
+                            active_clone_params.pop("prompt_text", None)
                             logger.warning(
                                 "This voxcpm version does not support reference/prompt voice cloning "
                                 "- continuing without cloning."
@@ -702,7 +757,7 @@ class KhmerTTSModelEngine:
                 pass
         gc.collect()
 
-        return audio, self.sample_rate, bool(ref_supported and voice_ref_path)
+        return audio, self.sample_rate, bool(active_clone_params)
 
     def _condition_reference_audio(self, ref_path: str) -> str:
         """
@@ -771,6 +826,7 @@ class KhmerTTSModelEngine:
         emotion: Optional[str] = None,
         temperature: float = 0.7,
         voice_ref_path: Optional[str] = None,
+        voice_ref_text: Optional[str] = None,
     ) -> SynthesisOutcome:
         """
         Synthesize Khmer speech waveform from normalized text.
@@ -809,22 +865,34 @@ class KhmerTTSModelEngine:
 
         # 1. Primary: REAL VoxCPM neural generation (GPU/CPU, voice cloning)
         if self.model_loaded and self.model is not None:
-            style = _build_style_instruction(prompt, emotion, speed)
+            # Decide ONCE how (and whether) cloning can actually happen with
+            # the loaded voxcpm build/model. In clone mode the timbre comes
+            # from the reference audio, so the voice-design prompt is NOT
+            # injected (it would fight the clone); only delivery hints
+            # (emotion / pacing) are kept.
+            clone_params = self._resolve_clone_params(ref_path, voice_ref_text)
+            style = _build_style_instruction(
+                prompt, emotion, speed, include_voice_design=not clone_params
+            )
             cfg_value = _map_temperature_to_cfg(temperature)
             cloning_applied = False
 
             try:
                 audio, sr, cloning_applied = await asyncio.to_thread(
-                    self._generate_voxcpm, text, speed, style, cfg_value, ref_path
+                    self._generate_voxcpm, text, speed, style, cfg_value, clone_params
                 )
             except Exception as ex:
                 logger.error(f"VoxCPM synthesis failed: {ex}", exc_info=True)
                 if voice_ref_path:
-                    # Retry once without the reference (timbre may be unusable)
+                    # Retry once without the reference (timbre may be unusable),
+                    # steering with the FULL voice-design prompt instead.
                     logger.warning("Retrying VoxCPM synthesis without voice reference...")
+                    style_full = _build_style_instruction(
+                        prompt, emotion, speed, include_voice_design=True
+                    )
                     try:
                         audio, sr, _unused = await asyncio.to_thread(
-                            self._generate_voxcpm, text, speed, style, cfg_value, None
+                            self._generate_voxcpm, text, speed, style_full, cfg_value, {}
                         )
                         cloning_applied = False
                         voxcpm_failure_reason = (

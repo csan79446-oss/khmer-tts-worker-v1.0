@@ -107,6 +107,18 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             logger.warning(f"Failed to decode voice reference audio: {ex}")
 
+    # Optional transcript of the reference audio (what is spoken in it).
+    # VoxCPM2 clones via reference_wav_path alone; legacy 1.x builds can only
+    # clone via the prompt_wav_path + prompt_text pair, which needs this.
+    ref_text_raw = (
+        job_input.get("reference_text")
+        or job_input.get("reference_prompt_text")
+        or job_input.get("reference_transcript")
+    )
+    ref_text = str(ref_text_raw).strip() if ref_text_raw else None
+    if ref_text:
+        logger.info(f"Reference transcript received ({len(ref_text)} chars)")
+
     try:
         # Obtain model engine singleton
         start_t = time.time()
@@ -122,6 +134,7 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             emotion=emotion,
             temperature=temperature,
             voice_ref_path=temp_ref_path,
+            voice_ref_text=ref_text,
         )
         audio_array = outcome.audio
         sample_rate = outcome.sample_rate

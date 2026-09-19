@@ -1,5 +1,9 @@
 runpod>=1.7.0
-voxcpm>=1.0.0
+# Modern build (VoxCPM2 API) - REQUIRED for true zero-shot voice cloning via
+# reference_wav_path (usable ALONE, no transcript). The legacy PyPI 1.x
+# package only supports the prompt_wav_path + prompt_text pair and cannot
+# load VoxCPM2 weights (the worker auto-downgrades to VoxCPM-0.5B then).
+voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git
 edge-tts>=6.1.9
 soundfile>=0.12.1
 numpy>=1.24.0

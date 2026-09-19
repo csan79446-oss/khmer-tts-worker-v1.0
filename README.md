@@ -11,7 +11,7 @@ Khmer TTS Studio Desktop Application.
 |---|---|
 | **VoxCPM neural synthesis** | Real `voxcpm` package, `VoxCPM.from_pretrained("openbmb/VoxCPM2")` (or a local checkpoint / Network Volume) |
 | **Voice Design** | The UI's voice-prompt presets + emotion are compiled into a VoxCPM control instruction, e.g. `(A warm Cambodian female voice, calm tone, slightly slower pace)` |
-| **Voice Cloning** | Base64 reference audio is decoded and passed as `reference_wav_path` (Controllable Cloning, VoxCPM2) — true timbre cloning |
+| **Voice Cloning** | Base64 reference audio is decoded and passed as `reference_wav_path` (VoxCPM2 true zero-shot cloning — used ALONE, no transcript needed). Legacy 1.x builds fall back to the `prompt_wav_path` + `prompt_text` pair (requires the reference transcript from the UI) or skip cloning with truthful provenance |
 | **Temperature** | Mapped onto VoxCPM `cfg_value` (0.7 → ≈2.0 balanced default; range 1.0–3.0) |
 | **Speed** | Soft style guidance + precise `librosa` time-stretch to guarantee the requested rate |
 | **Edge-TTS fallback** | Explicitly labelled and logged as `[FALLBACK]` (used only when VoxCPM weights can't load or the package is missing); **no** synthetic-beep generator exists anymore |
