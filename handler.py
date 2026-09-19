@@ -24,6 +24,11 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [Worker] %(message)s")
 logger = logging.getLogger("KhmerTTSHandler")
 
+# Ensure worker directory is on sys.path regardless of execution CWD
+_worker_dir = os.path.dirname(os.path.abspath(__file__))
+if _worker_dir not in sys.path:
+    sys.path.insert(0, _worker_dir)
+
 from model_engine import get_model_engine, preload_model, TTSWorkerError
 
 
@@ -168,9 +173,23 @@ if __name__ == "__main__":
         # Standard RunPod Serverless startup (natively supports async handler)
         try:
             import runpod
-            logger.info("Starting RunPod Serverless async worker loop...")
+            logger.info("Initializing Khmer TTS AI Worker for RunPod Serverless...")
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    logger.info(
+                        f"Hardware: GPU '{torch.cuda.get_device_name(0)}' detected "
+                        f"({torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB VRAM) "
+                        f"| PyTorch {torch.__version__} | CUDA {getattr(torch.version, 'cuda', 'unknown')}"
+                    )
+                else:
+                    logger.warning("Hardware: No GPU detected! Worker running on CPU.")
+            except ImportError:
+                pass
+
             # Warm the model before the first job arrives (cold-start hygiene).
             preload_model()
+            logger.info("Starting RunPod Serverless worker listening loop...")
             runpod.serverless.start({"handler": handler})
         except ImportError:
             logger.error("runpod SDK is not installed. To test locally, run: python handler.py --test")

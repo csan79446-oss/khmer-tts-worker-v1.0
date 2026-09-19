@@ -24,6 +24,7 @@ Environment variables:
   MODEL_PATH         local checkpoint/volume directory (default: /workspace/models)
 """
 import asyncio
+import gc
 import inspect
 import io
 import os
@@ -38,6 +39,12 @@ import soundfile as sf
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s")
 logger = logging.getLogger("KhmerTTSModelEngine")
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 try:
     import edge_tts
@@ -65,6 +72,45 @@ except ImportError:
 
 class TTSWorkerError(Exception):
     """Raised when the worker cannot produce audio. Marks the RunPod job FAILED."""
+
+
+def _discover_model_dir(explicit_dir: Optional[str] = None) -> Path:
+    """
+    Intelligently discover model storage path:
+    1. Explicit dir parameter
+    2. MODEL_PATH environment variable
+    3. /runpod-volume/models (RunPod default Network Volume mount)
+    4. /workspace/models (Common container mount)
+    5. Fallback to /workspace/models
+    """
+    if explicit_dir:
+        p = Path(explicit_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    env_dir = os.getenv("MODEL_PATH")
+    if env_dir:
+        p = Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Auto-detect mounted Network Volume paths
+    candidates = [
+        Path("/runpod-volume/models"),
+        Path("/workspace/models"),
+        Path("/app/models")
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    # Default fallback
+    fallback = Path("/runpod-volume/models") if Path("/runpod-volume").exists() else Path("/workspace/models")
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return fallback
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -235,7 +281,7 @@ def build_pretrained_kwargs(voxcpm_cls, load_denoiser: bool, optimize: bool, dev
         kwargs["optimize"] = optimize
     elif accepts("optimize_bn"):
         kwargs["optimize_bn"] = optimize
-    if device and device != "auto" and accepts("device"):
+    if device and accepts("device"):
         kwargs["device"] = device
 
     is_legacy = not (accepts("optimize") or accepts("device"))
@@ -286,9 +332,32 @@ class KhmerTTSModelEngine:
     """
 
     def __init__(self, model_dir: Optional[str] = None):
-        self.model_dir = Path(model_dir or os.getenv("MODEL_PATH", "/workspace/models"))
+        self.model_dir = _discover_model_dir(model_dir)
         self.model_id = os.getenv("VOXCPM_MODEL_ID", "openbmb/VoxCPM2").strip()
-        self.device = os.getenv("VOXCPM_DEVICE", "auto").strip() or "auto"
+
+        # Resolve device to concrete string ("cuda" or "cpu")
+        raw_device = os.getenv("VOXCPM_DEVICE", "auto").strip().lower() or "auto"
+        if raw_device == "auto":
+            if HAS_TORCH and torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = raw_device
+
+        if self.device == "cuda" and HAS_TORCH and torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                cuda_ver = getattr(torch.version, "cuda", "unknown")
+                logger.info(
+                    f"GPU Acceleration ACTIVE: {gpu_name} ({vram_gb:.2f} GB VRAM) | CUDA: {cuda_ver}"
+                )
+            except Exception as ex:
+                logger.info(f"GPU Acceleration ACTIVE (CUDA enabled): {ex}")
+        else:
+            logger.info(f"Engine running on device: {self.device}")
+
         self.inference_timesteps = max(4, min(30, int(os.getenv("VOXCPM_TIMESTEPS", "10"))))
         self.load_denoiser = _env_flag("VOXCPM_DENOISER", False)
         self.optimize = _env_flag("VOXCPM_OPTIMIZE", True)
@@ -363,6 +432,13 @@ class KhmerTTSModelEngine:
                 )
                 self.model = VoxCPM.from_pretrained(model_id, **pretrained_kwargs)
 
+            # Ensure model is on target device if from_pretrained didn't place it
+            if self.device == "cuda" and hasattr(self.model, "to"):
+                try:
+                    self.model.to("cuda")
+                except Exception as ex:
+                    logger.debug(f"Model .to('cuda') check: {ex}")
+
             # Safe sample-rate detection across package versions.
             tts_model = getattr(self.model, "tts_model", None)
             detected_sr = getattr(tts_model, "sample_rate", None) if tts_model is not None else None
@@ -403,6 +479,13 @@ class KhmerTTSModelEngine:
 
         wavs = []
         ref_supported = voice_ref_path is not None
+        ref_param = "reference_wav_path"
+        if ref_supported:
+            if "prompt_wav_path" in self.accepted_generate_kwargs and "reference_wav_path" not in self.accepted_generate_kwargs:
+                ref_param = "prompt_wav_path"
+            else:
+                ref_param = "reference_wav_path"
+
         for seg in segments:
             # Voice-Design / Controllable-Cloning control instruction is
             # prepended in parentheses before the target text.
@@ -413,10 +496,9 @@ class KhmerTTSModelEngine:
                 retry_badcase=True,
             )
             if ref_supported:
-                # Controllable Voice Cloning: reference_wav_path supplies the
-                # timbre; the parenthesized instruction steers style. No
-                # transcript of the reference is required (VoxCPM2).
-                kwargs["reference_wav_path"] = voice_ref_path
+                # Controllable Voice Cloning: reference_wav_path / prompt_wav_path
+                # supplies the timbre; the parenthesized instruction steers style.
+                kwargs[ref_param] = voice_ref_path
             kwargs = _filter_generate_kwargs(kwargs, self.accepted_generate_kwargs)
 
             # Shrink-and-retry: some voxcpm releases wrap generate(*args,
@@ -432,12 +514,18 @@ class KhmerTTSModelEngine:
                         raise
                     dropped = m.group(1)
                     kwargs.pop(dropped)
-                    if dropped == "reference_wav_path":
-                        ref_supported = False
-                        logger.warning(
-                            "This voxcpm version does not support reference_wav_path "
-                            "- voice cloning is unavailable; continuing without cloning."
-                        )
+                    if dropped in ("reference_wav_path", "prompt_wav_path"):
+                        alt_param = "prompt_wav_path" if dropped == "reference_wav_path" else "reference_wav_path"
+                        if alt_param not in kwargs and voice_ref_path and ref_supported:
+                            logger.info(f"Retrying with alternative voice reference param '{alt_param}'...")
+                            ref_param = alt_param
+                            kwargs[alt_param] = voice_ref_path
+                        else:
+                            ref_supported = False
+                            logger.warning(
+                                "This voxcpm version does not support reference/prompt voice cloning "
+                                "- continuing without cloning."
+                            )
                     else:
                         logger.warning(
                             f"Dropped generation param '{dropped}' unsupported by this voxcpm version"
@@ -456,6 +544,14 @@ class KhmerTTSModelEngine:
         # the requested rate).
         if HAS_LIBROSA and abs(speed - 1.0) >= 0.03:
             audio = librosa.effects.time_stretch(audio, rate=float(speed))
+
+        # Memory hygiene: clear CUDA cache and invoke garbage collection
+        if HAS_TORCH and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        gc.collect()
 
         return audio, self.sample_rate
 
@@ -539,6 +635,14 @@ class KhmerTTSModelEngine:
             raise TTSWorkerError("Missing or empty text for synthesis.")
 
         speed = max(0.5, min(2.0, float(speed)))
+
+        # Self-healing: if model failed to load on cold start, retry once lazily
+        if not self.model_loaded and HAS_VOXCPM:
+            logger.info("VoxCPM model not loaded; attempting lazy initialization on request...")
+            try:
+                self._load_model()
+            except Exception as ex:
+                logger.warning(f"Lazy VoxCPM initialization failed: {ex}")
 
         # Condition the voice reference (format-agnostic load, mono PCM16 at
         # the model rate, trimmed to avoid KV-cache overflow on long prompts).

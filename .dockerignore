@@ -1,9 +1,14 @@
 # Keep junk out of the worker image
+.git/
+.gitignore
+.gitattributes
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .pytest_cache/
-models/
+*.egg-info/
+models/*
 !models/.gitkeep
 test_output.wav
 output/

@@ -44,8 +44,8 @@ runpod_worker/
 | `VOXCPM_OPTIMIZE` | `1` | torch.compile optimizations (`0` to disable on issues) |
 | `MAX_REFERENCE_AUDIO_SECONDS` | `10` | Trim voice-clone reference audio (VoxCPM2's 8192-token KV cache overflows on long prompt prefill) |
 | `VOXCPM_PRELOAD` | `1` | Load weights at container start (cold-start hygiene) |
-| `MODEL_PATH` | `/workspace/models` | Local checkpoint / volume dir |
-| `HF_HOME` | `/workspace/models/hf_cache` | HF download cache (put on a Network Volume!) |
+| `MODEL_PATH` | `/workspace/models` | Local checkpoint / volume dir (auto-checks `/runpod-volume/models`) |
+| `HF_HOME` | `/workspace/models/hf_cache` | HF download cache (auto-checks `/runpod-volume/hf_cache`) |
 
 ## 🚀 Quick Start (Local Testing)
 
@@ -68,8 +68,8 @@ docker push your-dockerhub-username/khmer-tts-worker:v2.0
 ## ☁️ RunPod Serverless Deployment
 
 1. **Template**: container image above, **Container Disk ≥ 25 GB** (VoxCPM2 weights are multi-GB).
-2. **Network Volume** (strongly recommended): mount at `/workspace` and set
-   `HF_HOME=/workspace/models/hf_cache` so weights download **once**.
+2. **Network Volume** (strongly recommended): mount at `/runpod-volume` (RunPod default) or `/workspace`.
+   Worker code is isolated in `/app` so external volume mounts never mask the application code.
 3. **GPU**: RTX 4090 / 3090 / A40 (VoxCPM2 is a 2B model; ≥16 GB VRAM recommended).
    Min workers `0`, idle timeout `60 s`.
 4. Connect Endpoint URL + API Key in the desktop app's Settings → **VoxCPM & RunPod**.

@@ -44,8 +44,8 @@ docker push YOUR_DOCKERHUB_USERNAME/khmer-tts-worker:v2.0
 ## ជំហានទី ៣៖ បង្កើត Network Volume (ណែនាំខ្លាំង)
 
 1. ចូល **RunPod Console** ➡️ **Storage** ➡️ **Network Volume** ➡️ **New Volume**
-2. តម្លៃ៖ **Size `30GB`**, Region ដូច Endpoint របស់អ្នក។
-3. Volume នេះនឹង缓存 model weights (~៥GB+) ដូច្នេះ cold start លឿន និងមិនទាញឡើងវិញ។
+2. តម្លៃ៖ **Size `30GB`**, Region ដូច Endpoint របស់អ្នក (ឧ. US, EU...)
+3. Volume នេះនឹងរក្សាទុក model weights (~៥GB+) ដូច្នេះ cold start លឿន និងមិនទាញឡើងវិញរាល់ពេល Worker ថ្មីចាប់ផ្តើម។
 
 ---
 
@@ -56,17 +56,20 @@ docker push YOUR_DOCKERHUB_USERNAME/khmer-tts-worker:v2.0
    * **Template Name**: `Khmer-TTS-Worker`
    * **Container Image**: `YOUR_DOCKERHUB_USERNAME/khmer-tts-worker:v2.0`
    * **Container Disk**: `25GB` (ឬ `30GB`)
-   * **Volume Mount**: ភ្ជាប់ Network Volume ទៅ `/workspace`
-   * **Environment Variables** (កំណត់រួចក្នុង image រួចហើយ — កែបានតាមត្រូវការ)：
+   * **Volume Mount**: 
+     * អាចជ្រើសរើស `/runpod-volume` (Default របស់ RunPod) ឬ `/workspace`
+     * > [!NOTE]
+     * > Code របស់ Worker ត្រូវបានរក្សាទុកដាច់ដោយឡែកក្នុង `/app` ដូច្នេះការ mount volume ទៅ `/runpod-volume` ឬ `/workspace` នឹង **មិនបាត់បង់ ឬ overwrite code** ឡើយ! Worker នឹងស្វែងរក Model និង HuggingFace cache ដោយស្វ័យប្រវត្តិ។
+   * **Environment Variables** (កំណត់ស្រេចក្នុង Docker image — អាចប្តូរតាមចិត្ត)：
 
      | Variable | តម្លៃលំនាំដើម | អត្ថន័យ |
      | :--- | :--- | :--- |
-     | `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | Model repo ឬ local checkpoint |
-     | `VOXCPM_DEVICE` | `auto` | `cuda` / `cpu` / `auto` |
-     | `VOXCPM_TIMESTEPS` | `10` | Diffusion steps (4-30, ច្រើន = គុណភាពល្អ តែយឺត) |
+     | `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | Model repo ID ឬ local checkpoint directory |
+     | `VOXCPM_DEVICE` | `auto` | `auto` (ជ្រើស `cuda` អូតូបើមាន GPU, else `cpu`) |
+     | `VOXCPM_TIMESTEPS` | `10` | Diffusion timesteps (4-30, លំនាំដើម 10 លឿននិងច្បាស់) |
      | `VOXCPM_DENOISER` | `0` | `1` = ដាក់ denoiser សម្រាប់ reference audio |
-     | `HF_HOME` | `/workspace/models/hf_cache` | ត្រូវនៅលើ Volume! |
-     | `MODEL_PATH` | `/workspace/models` | Local checkpoint dir |
+     | `HF_HOME` | `/workspace/models/hf_cache` | ទីតាំង cache weights នៅលើ Network Volume |
+     | `MODEL_PATH` | `/workspace/models` | ទីតាំង local checkpoints (ស្វែងរក auto ក្នុង `/runpod-volume` ផងដែរ) |
 3. ចុច **Save Template**។
 
 ---
@@ -74,10 +77,12 @@ docker push YOUR_DOCKERHUB_USERNAME/khmer-tts-worker:v2.0
 ## ជំហានទី ៥៖ បង្កើត Serverless Endpoint
 
 1. **Serverless** ➡️ **Endpoints** ➡️ **New Endpoint** ➡️ ជ្រើស Template `Khmer-TTS-Worker`
-2. **GPU Types** (VoxCPM2 ជា model 2B — ត្រូវការ VRAM >= 16GB)៖
-   * **RTX 4090 (24GB)** ឬ **RTX 3090** ឬ **A40** (ណែនាំ)
-3. **Active Workers (Min)**: `0` | **Max Workers**: `2` | **Idle Timeout**: `60s`
-4. ចុច **Create Endpoint**។
+2. **GPU Types** (VoxCPM2 ជា foundation model 2B — ត្រូវការ VRAM >= 16GB)៖
+   * **RTX 4090 (24GB)** (ណែនាំខ្លាំងបំផុត — លឿនបំផុត និងតម្លៃសមរម្យ)
+   * **A40 (48GB)** ឬ **RTX 3090 (24GB)**
+3. **Execution Timeout**: កំណត់យ៉ាងតិច `180s` (សម្រាប់ Request វែង)
+4. **Active Workers (Min)**: `0` (សន្សំសំចៃ) | **Max Workers**: `2` | **Idle Timeout**: `60s`
+5. ចុច **Create Endpoint**។
 
 ---
 
