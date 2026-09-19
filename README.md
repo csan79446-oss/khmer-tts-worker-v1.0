@@ -37,7 +37,7 @@ runpod_worker/
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HF repo id, or a local checkpoint dir. **Auto-fallback:** if the installed `voxcpm` package is the 1.x API, the worker automatically switches to `openbmb/VoxCPM-0.5B` |
+| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HF repo id (the `Tha456/VoxCPM2` mirror works too), or a local checkpoint dir. **Auto-fallback:** if the installed `voxcpm` package is the 1.x PyPI API, the worker detects it at load time and automatically switches to `openbmb/VoxCPM-0.5B` (16 kHz) instead of crashing after the multi-GB download. For true 48 kHz VoxCPM2 output, install a modern build: `pip install git+https://github.com/OpenBMB/VoxCPM.git` |
 | `VOXCPM_DEVICE` | `auto` | `auto` (cuda→mps→cpu), `cuda`, `cpu` |
 | `VOXCPM_TIMESTEPS` | `10` | Diffusion steps (4–30; more = better quality, slower) |
 | `VOXCPM_DENOISER` | `0` | Load reference-audio denoiser (16 kHz pipeline) |

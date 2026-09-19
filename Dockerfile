@@ -19,6 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # By default we support /workspace or /runpod-volume (RunPod default).
 ENV HF_HOME=/workspace/models/hf_cache
 ENV MODEL_PATH=/workspace/models
+# Target checkpoint. NOTE: the PyPI 'voxcpm' 1.x package cannot load VoxCPM2
+# weights - the worker detects this at load time and automatically downgrades
+# to 'openbmb/VoxCPM-0.5B' (16 kHz) instead of crashing after the download.
+# For true 48 kHz VoxCPM2 output install a modern build, e.g.:
+#   pip install --no-cache-dir git+https://github.com/OpenBMB/VoxCPM.git
+# Mirror repos (e.g. Tha456/VoxCPM2) also work as VOXCPM_MODEL_ID values.
 ENV VOXCPM_MODEL_ID=openbmb/VoxCPM2
 ENV VOXCPM_DEVICE=auto
 ENV VOXCPM_TIMESTEPS=10

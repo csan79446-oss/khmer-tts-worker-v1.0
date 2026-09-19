@@ -31,7 +31,7 @@ import os
 import logging
 import re
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, NamedTuple
 
 import numpy as np
 import soundfile as sf
@@ -72,6 +72,34 @@ except ImportError:
 
 class TTSWorkerError(Exception):
     """Raised when the worker cannot produce audio. Marks the RunPod job FAILED."""
+
+
+# Canonical engine labels reported back to the desktop client. The client
+# surfaces this string to the user, so it must always describe the engine that
+# REALLY produced the audio - never merely the engine we hoped to use.
+ENGINE_LABEL_VOXCPM = "VoxCPM"
+ENGINE_LABEL_EDGE_FALLBACK = "Edge-TTS (fallback)"
+
+
+class SynthesisOutcome(NamedTuple):
+    """
+    Result of one synthesis attempt, including truthful engine provenance.
+
+    Fields:
+        audio                : float32 mono waveform
+        sample_rate          : native sample rate of that waveform
+        engine               : ENGINE_LABEL_VOXCPM or ENGINE_LABEL_EDGE_FALLBACK
+        voice_cloning_applied: True only when the caller's reference audio was
+                               actually used to clone the voice
+        fallback_reason      : human-readable reason the primary engine failed
+                               (None when VoxCPM produced the audio cleanly)
+    """
+    audio: np.ndarray
+    sample_rate: int
+    engine: str
+    voice_cloning_applied: bool = False
+    fallback_reason: Optional[str] = None
+
 
 
 def _discover_model_dir(explicit_dir: Optional[str] = None) -> Path:
@@ -266,13 +294,21 @@ def build_pretrained_kwargs(voxcpm_cls, load_denoiser: bool, optimize: bool, dev
     ]
 
     def accepts(name: str) -> bool:
+        # from_pretrained may be a thin *args/**kwargs forwarder whose public
+        # signature hides the real contract; in that case consult __init__.
+        # Only an explicit named parameter proves acceptance - a wrong kwarg
+        # raises TypeError only AFTER the multi-GB weights have been
+        # downloaded, so unknown kwargs must never be forwarded blindly.
         for info in infos:
             if info is None:
-                return True  # signature unknown -> optimistically pass through
+                continue
             names, has_varkw = info
-            if has_varkw or name in names:
-                return True
-        return False
+            if has_varkw:
+                continue  # forwarding wrapper: real contract not visible here
+            return name in names
+        # Both signatures unknown (or pure *args/**kwargs): optimistically
+        # pass through; the load-time retry below drops rejected kwargs.
+        return True
 
     kwargs = {}
     if accepts("load_denoiser"):
@@ -286,6 +322,44 @@ def build_pretrained_kwargs(voxcpm_cls, load_denoiser: bool, optimize: bool, dev
 
     is_legacy = not (accepts("optimize") or accepts("device"))
     return kwargs, is_legacy
+
+
+def _is_voxcpm2_family(model_id: str) -> bool:
+    """
+    True for any VoxCPM2-generation checkpoint id: 'openbmb/VoxCPM2',
+    mirrors such as 'Tha456/VoxCPM2', and variants like 'voxcpm-2' or
+    'VoxCPM2-1.5B'. The legacy 1.x PyPI package cannot run these weights
+    and must be downgraded to 'openbmb/VoxCPM-0.5B' instead.
+    """
+    return bool(re.search(r"voxcpm[-_]?2", str(model_id), re.IGNORECASE))
+
+
+def _pretrained_load_with_retry(voxcpm_cls, model_id: str, kwargs: dict):
+    """
+    Call voxcpm_cls.from_pretrained(model_id, **kwargs), dropping kwargs the
+    runtime rejects one at a time and retrying.
+
+    Why: signature introspection cannot see through *args/**kwargs wrappers,
+    and a rejected kwarg currently raises TypeError only AFTER the multi-GB
+    weights have been downloaded. HuggingFace caches the download, so the
+    retry is cheap. Returns (model, kwargs_actually_used).
+    """
+    current = dict(kwargs)
+    while True:
+        try:
+            return voxcpm_cls.from_pretrained(model_id, **current), current
+        except TypeError as ex:
+            m = re.search(r"unexpected keyword argument '(\w+)'", str(ex))
+            if not m or m.group(1) not in current:
+                raise
+            dropped = m.group(1)
+            current.pop(dropped)
+            logger.warning(
+                f"from_pretrained rejected kwarg '{dropped}' at runtime; "
+                "dropping it and retrying (weights are HF-cached, retry is cheap)."
+            )
+            if not current:
+                raise
 
 
 def _consume_generated(generated) -> np.ndarray:
@@ -334,6 +408,10 @@ class KhmerTTSModelEngine:
     def __init__(self, model_dir: Optional[str] = None):
         self.model_dir = _discover_model_dir(model_dir)
         self.model_id = os.getenv("VOXCPM_MODEL_ID", "openbmb/VoxCPM2").strip()
+        # Checkpoint id ACTUALLY loaded (differs from model_id when the legacy
+        # 1.x package forces a downgrade to VoxCPM-0.5B). Reported to the
+        # desktop client as provenance.
+        self.effective_model_id = self.model_id
 
         # Resolve device to concrete string ("cuda" or "cpu")
         raw_device = os.getenv("VOXCPM_DEVICE", "auto").strip().lower() or "auto"
@@ -412,25 +490,32 @@ class KhmerTTSModelEngine:
             )
 
             model_id = self.model_id
-            if self._legacy_api and model_id.rstrip("/").endswith("VoxCPM2"):
+            if self._legacy_api and _is_voxcpm2_family(model_id):
                 # The 1.x package cannot run VoxCPM2 weights - fall back.
+                # (Catches 'openbmb/VoxCPM2', mirrors like 'Tha456/VoxCPM2',
+                # and variants such as 'voxcpm-2' / 'VoxCPM2-1.5B'.)
                 model_id = "openbmb/VoxCPM-0.5B"
                 logger.warning(
                     "Installed 'voxcpm' package is the 1.x API (no device/optimize "
                     "support), which cannot load VoxCPM2 weights. Automatically "
                     f"switching model to {model_id}."
                 )
+            self.effective_model_id = model_id
 
             local_checkpoint = self._resolve_local_checkpoint()
             if local_checkpoint:
                 logger.info(f"Using local VoxCPM checkpoint: {local_checkpoint}")
-                self.model = VoxCPM.from_pretrained(str(local_checkpoint), **pretrained_kwargs)
+                self.model, pretrained_kwargs = _pretrained_load_with_retry(
+                    VoxCPM, str(local_checkpoint), pretrained_kwargs
+                )
             else:
                 logger.info(
                     f"No local checkpoint found; downloading/loading from HuggingFace Hub "
                     f"(id={model_id}, kwargs={sorted(pretrained_kwargs) or '(defaults)'})..."
                 )
-                self.model = VoxCPM.from_pretrained(model_id, **pretrained_kwargs)
+                self.model, pretrained_kwargs = _pretrained_load_with_retry(
+                    VoxCPM, model_id, pretrained_kwargs
+                )
 
             # Ensure model is on target device if from_pretrained didn't place it
             if self.device == "cuda" and hasattr(self.model, "to"):
@@ -471,8 +556,16 @@ class KhmerTTSModelEngine:
         style_instruction: str,
         cfg_value: float,
         voice_ref_path: Optional[str],
-    ) -> Tuple[np.ndarray, int]:
-        """Real VoxCPM neural generation (blocking; run in a worker thread)."""
+    ) -> Tuple[np.ndarray, int, bool]:
+        """
+        Real VoxCPM neural generation (blocking; run in a worker thread).
+
+        Returns (audio, sample_rate, voice_cloning_applied). The cloning flag is
+        True only if the reference audio was actually forwarded to the model -
+        some voxcpm releases silently reject reference/prompt params, in which
+        case generation continues WITHOUT cloning and the caller must not claim
+        otherwise.
+        """
         segments = _split_text_for_voxcpm(text)
         if len(segments) > 1:
             logger.info(f"VoxCPM: splitting long text into {len(segments)} segment(s)")
@@ -553,7 +646,7 @@ class KhmerTTSModelEngine:
                 pass
         gc.collect()
 
-        return audio, self.sample_rate
+        return audio, self.sample_rate, bool(ref_supported and voice_ref_path)
 
     def _condition_reference_audio(self, ref_path: str) -> str:
         """
@@ -622,12 +715,14 @@ class KhmerTTSModelEngine:
         emotion: Optional[str] = None,
         temperature: float = 0.7,
         voice_ref_path: Optional[str] = None,
-    ) -> Tuple[np.ndarray, int]:
+    ) -> SynthesisOutcome:
         """
         Synthesize Khmer speech waveform from normalized text.
 
         Returns:
-            Tuple[np.ndarray, int]: (audio_waveform_float32, sample_rate)
+            SynthesisOutcome: (audio, sample_rate, engine, voice_cloning_applied,
+            fallback_reason). `engine` names the engine that REALLY produced the
+            audio, so a fallback is never misreported as VoxCPM.
         Raises:
             TTSWorkerError: when every synthesis path fails (job -> FAILED).
         """
@@ -653,13 +748,17 @@ class KhmerTTSModelEngine:
             if ref_path != voice_ref_path:
                 conditioned_ref = ref_path
 
+        # Tracks why VoxCPM did not produce the audio (surfaced to the user).
+        voxcpm_failure_reason: Optional[str] = None
+
         # 1. Primary: REAL VoxCPM neural generation (GPU/CPU, voice cloning)
         if self.model_loaded and self.model is not None:
             style = _build_style_instruction(prompt, emotion, speed)
             cfg_value = _map_temperature_to_cfg(temperature)
+            cloning_applied = False
 
             try:
-                audio, sr = await asyncio.to_thread(
+                audio, sr, cloning_applied = await asyncio.to_thread(
                     self._generate_voxcpm, text, speed, style, cfg_value, ref_path
                 )
             except Exception as ex:
@@ -668,14 +767,22 @@ class KhmerTTSModelEngine:
                     # Retry once without the reference (timbre may be unusable)
                     logger.warning("Retrying VoxCPM synthesis without voice reference...")
                     try:
-                        audio, sr = await asyncio.to_thread(
+                        audio, sr, _unused = await asyncio.to_thread(
                             self._generate_voxcpm, text, speed, style, cfg_value, None
+                        )
+                        cloning_applied = False
+                        voxcpm_failure_reason = (
+                            f"Voice reference rejected ({ex}); VoxCPM retried without cloning."
                         )
                     except Exception as ex2:
                         logger.error(f"VoxCPM retry without reference also failed: {ex2}")
                         audio, sr = None, None
+                        voxcpm_failure_reason = (
+                            f"VoxCPM failed with reference ({ex}) and without it ({ex2})."
+                        )
                 else:
                     audio, sr = None, None
+                    voxcpm_failure_reason = f"VoxCPM generation error: {ex}"
 
             if audio is not None:
                 logger.info(
@@ -689,26 +796,48 @@ class KhmerTTSModelEngine:
                         os.remove(conditioned_ref)
                     except OSError:
                         pass
-                return audio.astype(np.float32), sr
+                return SynthesisOutcome(
+                    audio=audio.astype(np.float32),
+                    sample_rate=int(sr),
+                    engine=ENGINE_LABEL_VOXCPM,
+                    voice_cloning_applied=bool(cloning_applied),
+                    fallback_reason=voxcpm_failure_reason,
+                )
 
             if conditioned_ref:
                 try:
                     os.remove(conditioned_ref)
                 except OSError:
                     pass
+        else:
+            voxcpm_failure_reason = (
+                "VoxCPM model is not loaded (the 'voxcpm' package is missing or the "
+                "weights failed to load)."
+            )
 
         # 2. Explicitly-labelled Edge-TTS fallback
         if HAS_EDGE_TTS:
             try:
                 audio, sr = await self._synthesize_edge_fallback(text, speed, prompt)
+                reason = voxcpm_failure_reason or "VoxCPM unavailable; Edge-TTS fallback used."
                 logger.warning(
                     "[FALLBACK] Audio produced by Edge-TTS (NOT VoxCPM). "
                     "Voice cloning and emotion control were NOT applied. "
-                    f"duration={len(audio)/sr:.2f}s"
+                    f"Reason: {reason} | duration={len(audio)/sr:.2f}s"
                 )
-                return audio, sr
+                return SynthesisOutcome(
+                    audio=np.clip(audio.astype(np.float32), -1.0, 1.0),
+                    sample_rate=int(sr),
+                    engine=ENGINE_LABEL_EDGE_FALLBACK,
+                    voice_cloning_applied=False,
+                    fallback_reason=reason,
+                )
             except Exception as ex:
                 logger.error(f"Edge-TTS fallback failed: {ex}")
+                raise TTSWorkerError(
+                    "All synthesis engines failed. VoxCPM is not loaded and the "
+                    f"Edge-TTS fallback is unavailable (offline or blocked): {ex}"
+                ) from ex
 
         # 3. Hard failure - no fake beeps.
         raise TTSWorkerError(

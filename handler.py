@@ -29,7 +29,7 @@ _worker_dir = os.path.dirname(os.path.abspath(__file__))
 if _worker_dir not in sys.path:
     sys.path.insert(0, _worker_dir)
 
-from model_engine import get_model_engine, preload_model, TTSWorkerError
+from model_engine import get_model_engine, preload_model, TTSWorkerError, ENGINE_LABEL_VOXCPM
 
 
 def normalize_khmer_text(text: str) -> str:
@@ -55,8 +55,14 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "sample_rate": 48000,
             "duration": 4.52,
             "status": "success",
-            "engine": "VoxCPM" | "Edge-TTS (fallback)"
+            "engine": "VoxCPM" | "Edge-TTS (fallback)",
+            "voice_cloning_applied": true | false,
+            "fallback_reason": "<why the primary engine failed>"  # omitted on clean VoxCPM runs
         }
+
+        The "engine" field always names the engine that REALLY produced the
+        audio. A silent degradation to Edge-TTS is reported as
+        "Edge-TTS (fallback)" - never as "VoxCPM".
     Raises:
         ValueError / TTSWorkerError -> RunPod marks the job FAILED.
     """
@@ -106,8 +112,10 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         start_t = time.time()
         engine = get_model_engine()
 
-        # Asynchronously synthesize audio (raises TTSWorkerError on total failure)
-        audio_array, sample_rate = await engine.synthesize(
+        # Asynchronously synthesize audio (raises TTSWorkerError on total failure).
+        # The outcome names the engine that ACTUALLY produced the audio, so a
+        # silent fallback is never reported as "VoxCPM".
+        outcome = await engine.synthesize(
             text=text,
             speed=speed,
             prompt=prompt,
@@ -115,14 +123,23 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             temperature=temperature,
             voice_ref_path=temp_ref_path,
         )
+        audio_array = outcome.audio
+        sample_rate = outcome.sample_rate
+        used_engine = outcome.engine
 
         duration = len(audio_array) / float(sample_rate) if sample_rate > 0 else 0.0
         elapsed = time.time() - start_t
-        used_engine = "VoxCPM" if engine.model_loaded else "Edge-TTS (fallback)"
         logger.info(
             f"Synthesis finished in {elapsed:.2f}s | engine={used_engine} | "
+            f"voice_cloning={outcome.voice_cloning_applied} | "
             f"Audio duration: {duration:.2f}s"
         )
+        if used_engine != ENGINE_LABEL_VOXCPM:
+            logger.warning(
+                f"Job {job_id} degraded to '{used_engine}' - audio was NOT produced by "
+                f"VoxCPM (voice cloning, emotion and temperature were not applied). "
+                f"Reason: {outcome.fallback_reason}"
+            )
 
         # Encode generated PCM float32 array to 16-bit WAV PCM in memory
         bio = io.BytesIO()
@@ -136,6 +153,14 @@ async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "duration": round(duration, 3),
             "status": "success",
             "engine": used_engine,
+            "voice_cloning_applied": bool(outcome.voice_cloning_applied),
+            # VoxCPM checkpoint actually configured/loaded for this job
+            # (differs from VOXCPM_MODEL_ID when the legacy 1.x package
+            # forced a downgrade). The desktop client surfaces this as
+            # worker provenance in the generation diagnostics.
+            "model_id": getattr(engine, "effective_model_id", None) or "unknown",
+            **({"fallback_reason": outcome.fallback_reason[:500]}
+               if outcome.fallback_reason else {}),
         }
 
     finally:
