@@ -64,20 +64,49 @@ ENV PYTHONPATH=/app
 #      "ResolutionImpossible" and the builder reports "exit code: 1".
 #      The image's own torchaudio already satisfies requirements.txt.
 # ---------------------------------------------------------------------------
-COPY requirements.txt /app/requirements.txt
+# Pip may be asked to install into a python that is marked "externally managed"
+# (PEP 668). Inside a container that is exactly what we want, and the setting is
+# a no-op when the marker is absent.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
+COPY requirements.txt constraints.txt check_imports.py /app/
+
+# --- Step 0: environment facts --------------------------------------------
+# If a later step fails, these lines make the cause readable from the build log
+# alone (python/pip version, the constraint file the image ships, PEP 668).
+RUN set -eux; \
+    python -V; \
+    python -m pip -V; \
+    echo "PIP_CONSTRAINT=${PIP_CONSTRAINT:-<unset>}"; \
+    echo '--- original NGC pip constraint file (first 40 lines) ---'; \
+    head -n 40 /etc/pip/constraint.txt 2>/dev/null || echo '(no /etc/pip/constraint.txt in this image)'; \
+    (ls -l /usr/lib/python3*/EXTERNALLY-MANAGED 2>/dev/null && echo '(PEP 668 marker present)') || echo '(no PEP 668 externally-managed marker)'
+
+# --- Step 1: replace NGC's blanket pin file -------------------------------
+# Those pins cover every package the container was built with and make current
+# PyPI packages (gradio 6, datasets 3, funasr, modelscope, ...) unresolvable.
+# Keep only the two CUDA/ABI-critical pins, taken from the image itself.
 RUN set -eux; \
     python -c "import torch, torchaudio; print('torch==' + torch.__version__); print('torchaudio==' + torchaudio.__version__)" > /etc/pip/constraint.txt; \
-    echo '--- pip constraints (replaces the NGC blanket pin file) ---'; \
-    cat /etc/pip/constraint.txt; \
-    echo '--- installing worker requirements ---'; \
-    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir --upgrade pip; \
-    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir -r /app/requirements.txt; \
+    echo '--- pip constraints in use (torch/torchaudio pinned to the image builds) ---'; \
+    cat /etc/pip/constraint.txt
+
+# --- Step 2: pip itself ----------------------------------------------------
+RUN PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir --upgrade pip
+
+# --- Step 3: worker requirements ------------------------------------------
+# -c constraints.txt pins the runtime stack to the versions inside voxcpm
+# 2.0.3's own uv.lock, so a rebuild can never pick up an untested release that
+# changed an API the engine relies on.
+RUN set -eux; \
+    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt; \
     echo '--- key package versions now in the image ---'; \
-    python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|numpy|librosa|soundfile|edge-tts|runpod)='; \
-    echo '--- import smoke test: fail the BUILD now, not the first paid job ---'; \
-    python -c "import torch, torchaudio, numpy, soundfile, librosa, edge_tts, runpod; print('core imports OK | torch', torch.__version__)"; \
-    python -c "import voxcpm; print('voxcpm import OK | version', getattr(voxcpm, '__version__', 'unknown'))"
+    python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope)='
+
+# --- Step 4: import checks -------------------------------------------------
+# Core deps are fatal; librosa/voxcpm are reported with a full traceback and do
+# not abort the build (see check_imports.py for the reasoning).
+RUN python /app/check_imports.py
 
 # Application worker code (isolated in /app so Network Volume mounts at
 # /workspace or /runpod-volume NEVER mask or overwrite the handler scripts)
