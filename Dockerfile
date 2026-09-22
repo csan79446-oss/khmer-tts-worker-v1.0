@@ -1,5 +1,7 @@
-# PyTorch 2.5.1 + CUDA 12.4 base image (VoxCPM requires torch >= 2.5.0)
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+# NVIDIA NGC PyTorch 25.04 — includes PyTorch 2.7+ with CUDA 13.0 + Blackwell (sm_100) support.
+# Use this image when RunPod assigns Blackwell GPUs (B200/GB200, compute capability sm_100).
+# For older GPUs (RTX 4090/A100/H100), pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime also works.
+FROM nvcr.io/nvidia/pytorch:25.04-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -41,7 +43,7 @@ ENV PYTHONPATH=/app
 #    never downgrades torch or pulls incompatible CPU torchaudio when voxcpm installs.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124 && \
+    pip install --no-cache-dir torchaudio && \
     pip install --no-cache-dir -r /app/requirements.txt
 
 # Application worker code (isolated in /app so Network Volume mounts at

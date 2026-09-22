@@ -115,7 +115,8 @@ docker push YOUR_DOCKERHUB_USERNAME/khmer-tts-worker:v2.0
 | **Authentication Failed (401/403)** | API Key មិនត្រឹមត្រូវ | ពិនិត្យ API Key ឡើងវិញ |
 | **Endpoint Not Found (404)** | Endpoint ID ខុស | URL ត្រូវមានទម្រង់ `https://api.runpod.ai/v2/{ENDPOINT_ID}` |
 | **Job Timeout / Cold Start យឺត** | ទាញ model weights លើកដំបូង | ប្រើ **Network Volume** + `HF_HOME`; បង្កើន Timeout ក្នុង Settings ទៅ 300s |
-| **CUDA Out of Memory** | VRAM មិនគ្រប់គ្រាន់សម្រាប់ VoxCPM2 (2B) | ប្រើ GPU >= 16GB ឬ 24GB (RTX 3090/4090) |
+| **CUDA OOM** | VRAM មិនគ្រប់គ្រាន់សម្រាប់ VoxCPM2 (2B) | ប្រើ GPU >= 16GB ឬ 24GB (RTX 3090/4090) |
+| **`no kernel image available` / Worker unhealthy** | GPU ជំនាន់ Blackwell (B200, sm_100) — PyTorch 2.5.1+CUDA12.4 មិនគាំទ្រ | **ជម្រើស A (ងាយ):** Endpoint → Edit → GPU Types → deselect B200 → ប្រើ RTX 4090/A100/H100 ។ **ជម្រើស B:** Rebuild Docker image ដោយប្រើ `FROM nvcr.io/nvidia/pytorch:25.04-py3` |
 | **តេស្តឃើញ `engine: Edge-TTS (fallback)`** | `voxcpm` មិនទាន់បាន install / weights មិនទាន់ទាញ | ពិនិត្យ worker logs; រង់ចាំ cold start ដំបូងបំពេញ |
 | **សំឡេងខ្មែរមិនធម្មជាតិ** | Khmer អាចមិនមែនជាភាសា officially supported ក្នុង VoxCPM2 | សាកល្បង `VOXCPM_TIMESTEPS` ខ្ពស់ជាង (15-20), ប្រើ reference audio, ឬ LoRA fine-tune |
 
