@@ -1,4 +1,5 @@
-# NVIDIA NGC PyTorch 25.04 — includes PyTorch 2.7+ with CUDA 13.0 + Blackwell (sm_100) support.
+# NVIDIA NGC PyTorch 25.04 — PyTorch 2.7.0 (NVIDIA build 2.7.0a0+79aa17489c, Python 3.12)
+# with CUDA 12.9 + Blackwell (sm_100) support.
 # Use this image when RunPod assigns Blackwell GPUs (B200/GB200, compute capability sm_100).
 # For older GPUs (RTX 4090/A100/H100), pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime also works.
 FROM nvcr.io/nvidia/pytorch:25.04-py3
@@ -37,12 +38,44 @@ ENV VOXCPM_TIMESTEPS=10
 ENV VOXCPM_PRELOAD=1
 ENV PYTHONPATH=/app
 
-# Python dependencies:
-# NGC base image already includes PyTorch 2.7+ and torchaudio — do NOT reinstall them.
-# Only install worker-specific packages (runpod, voxcpm, edge-tts, soundfile, etc.)
+# ---------------------------------------------------------------------------
+# Python dependencies
+#
+# The NGC image already ships PyTorch, torchaudio and the whole CUDA stack, so
+# this step only adds the worker's own packages. Two traps live here:
+#
+#   1) Since NGC 25.03 the container exports PIP_CONSTRAINT=/etc/pip/constraint.txt
+#      — an exact-pin file listing EVERY package the image was built with. Each
+#      pip run inside the image inherits it, which makes current PyPI packages
+#      (gradio 6, datasets 3, funasr, modelscope, huggingface-hub, ...)
+#      unresolvable and aborts the build with "exit code: 1" (the real pip error
+#      scrolls by above that line).
+#      -> We REWRITE that file with a minimal constraint set that only pins the
+#         two CUDA/ABI-critical packages to the builds already in the image.
+#         pip can therefore never silently re-download a multi-GB PyPI
+#         torch/torchaudio (the classic cause of these failed builds), while
+#         every other package resolves normally.
+#
+#   2) Never add `pip install torchaudio` (or torch) to this image: PyPI's
+#      torchaudio pins `torch==<exact release>`, while this container ships an
+#      NVIDIA pre-release build (2.7.0a0+<hash>) that PEP 440 ranks BELOW
+#      2.7.0. pip would attempt to replace the entire CUDA stack. The image's
+#      own torchaudio already satisfies requirements.txt (torchaudio>=2.5.0).
+# ---------------------------------------------------------------------------
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+
+RUN set -eux; \
+    python -c "import torch, torchaudio; print('torch==' + torch.__version__); print('torchaudio==' + torchaudio.__version__)" > /etc/pip/constraint.txt; \
+    echo '--- pip constraints (replaces the NGC blanket pin file) ---'; \
+    cat /etc/pip/constraint.txt; \
+    echo '--- installing worker requirements ---'; \
+    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir --upgrade pip; \
+    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir -r /app/requirements.txt; \
+    echo '--- key package versions now in the image ---'; \
+    python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|numpy|librosa|soundfile|edge-tts|runpod)='; \
+    echo '--- import smoke test: fail the BUILD now, not the first paid job ---'; \
+    python -c "import torch, torchaudio, numpy, soundfile, librosa, edge_tts, runpod; print('core imports OK | torch', torch.__version__)"; \
+    python -c "import voxcpm; print('voxcpm import OK | version', getattr(voxcpm, '__version__', 'unknown'))"
 
 # Application worker code (isolated in /app so Network Volume mounts at
 # /workspace or /runpod-volume NEVER mask or overwrite the handler scripts)

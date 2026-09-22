@@ -1,11 +1,53 @@
 runpod>=1.7.0
-# Modern build (VoxCPM2 API) - REQUIRED for true zero-shot voice cloning via
-# reference_wav_path (usable ALONE, no transcript). The legacy PyPI 1.x
-# package only supports the prompt_wav_path + prompt_text pair and cannot
-# load VoxCPM2 weights (the worker auto-downgrades to VoxCPM-0.5B then).
-voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git
+
+# ---------------------------------------------------------------------------
+# VoxCPM — pinned to an exact release tag so a RunPod rebuild can never pick up
+# an untested upstream dependency change. (An unpinned git URL rebuilds
+# whatever OpenBMB's `main` happens to be that day — that is how a build that
+# worked yesterday starts failing today.)
+#
+# 2.0.3 = latest tagged release; exposes the VoxCPM2 API used by model_engine.py
+#         (VoxCPM(...).generate(..., reference_wav_path=...)).
+# ---------------------------------------------------------------------------
+voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3
+
+# VoxCPM declares `torchcodec` (unpinned) but NEVER imports it: a full grep of
+# the 2.0.3 sdist for "torchcodec" matches only pyproject.toml / PKG-INFO /
+# uv.lock — zero .py files. Left unpinned, pip resolves torchcodec 0.16, which
+# is built for torch >= 2.11 and cannot load against the torch 2.7 build that
+# ships inside nvcr.io/nvidia/pytorch:25.04-py3. Pin the last release built for
+# torch 2.7 (torchcodec 0.5, per PyTorch's compatibility table) so the installed
+# wheel always matches the interpreter's torch ABI.
+torchcodec==0.5
+
 edge-tts>=6.1.9
 soundfile>=0.12.1
 numpy>=1.24.0
 librosa>=0.10.1
 pydantic>=2.0.0
+
+# ---------------------------------------------------------------------------
+# WHY THESE TWO LINES EXIST (do not delete them)
+#
+# The worker image installs PyTorch from the NGC base image
+# (nvcr.io/nvidia/pytorch:25.04-py3), whose torch is an NVIDIA pre-release
+# build: 2.7.0a0+79aa17489c. Since NGC 25.03 that container also forces
+# PIP_CONSTRAINT=/etc/pip/constraint.txt, which pins torch to exactly that
+# pre-release.
+#
+# VoxCPM requires `torch>=2.5.0` (a plain, non-pre-release specifier) and by
+# PEP 440 pip refuses to satisfy such a specifier with a pre-release version.
+# The resolver therefore reports:
+#
+#     voxcpm 2.0.3 depends on torch>=2.5.0
+#     The user requested (constraint) torch==2.7.0a0+79aa17489c
+#     ERROR: ResolutionImpossible  ->  docker build "exit code: 1"
+#
+# Mentioning a pre-release in the specifier (`>=2.5.0a0`) tells pip that
+# pre-releases are acceptable FOR THESE TWO PACKAGES ONLY, so the container's
+# own pre-release torch/torchaudio satisfy the requirement and pip keeps them
+# instead of trying to download a multi-GB stable CUDA build from PyPI.
+# ---------------------------------------------------------------------------
+torch>=2.5.0a0
+torchaudio>=2.5.0a0
+
