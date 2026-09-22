@@ -56,11 +56,13 @@ ENV PYTHONPATH=/app
 #         torch/torchaudio (the classic cause of these failed builds), while
 #         every other package resolves normally.
 #
-#   2) Never add `pip install torchaudio` (or torch) to this image: PyPI's
-#      torchaudio pins `torch==<exact release>`, while this container ships an
-#      NVIDIA pre-release build (2.7.0a0+<hash>) that PEP 440 ranks BELOW
-#      2.7.0. pip would attempt to replace the entire CUDA stack. The image's
-#      own torchaudio already satisfies requirements.txt (torchaudio>=2.5.0).
+#   2) Never add `pip install torchaudio` (or torch) to this image. PyPI's
+#      torchaudio declares an exact torch pin (torchaudio 2.7.0 -> torch==2.7.0,
+#      2.11.0 -> torch==2.11.0), which the container's pre-release build
+#      (2.7.0a0+<hash>) can never satisfy - and the constraint file above
+#      forbids installing any other torch, so pip ends with
+#      "ResolutionImpossible" and the builder reports "exit code: 1".
+#      The image's own torchaudio already satisfies requirements.txt.
 # ---------------------------------------------------------------------------
 COPY requirements.txt /app/requirements.txt
 

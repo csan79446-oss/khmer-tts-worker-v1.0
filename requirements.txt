@@ -29,24 +29,23 @@ pydantic>=2.0.0
 # ---------------------------------------------------------------------------
 # WHY THESE TWO LINES EXIST (do not delete them)
 #
-# The worker image installs PyTorch from the NGC base image
-# (nvcr.io/nvidia/pytorch:25.04-py3), whose torch is an NVIDIA pre-release
-# build: 2.7.0a0+79aa17489c. Since NGC 25.03 that container also forces
-# PIP_CONSTRAINT=/etc/pip/constraint.txt, which pins torch to exactly that
-# pre-release.
+# The worker takes PyTorch from the NGC base image: torch and torchaudio are
+# NVIDIA *pre-release* builds (2.7.0a0+79aa17489c), and since NGC 25.03 the
+# image pins them through /etc/pip/constraint.txt.
 #
-# VoxCPM requires `torch>=2.5.0` (a plain, non-pre-release specifier) and by
-# PEP 440 pip refuses to satisfy such a specifier with a pre-release version.
-# The resolver therefore reports:
+# A specifier that never mentions a pre-release (e.g. VoxCPM's `torch>=2.5.0`)
+# lets pip consider only stable candidates whenever it must select from an
+# index. Verified against PyPI metadata:
+#   * torchaudio 2.7.0  declares `torch==2.7.0`
+#   * torchaudio 2.11.0 declares `torch==2.11.0`
+# Neither can ever be satisfied by the pinned pre-release build, so pip ends
+# the build with `ResolutionImpossible` -> RunPod reports "exit code: 1".
+# That is exactly what the removed `pip install torchaudio` step used to do.
 #
-#     voxcpm 2.0.3 depends on torch>=2.5.0
-#     The user requested (constraint) torch==2.7.0a0+79aa17489c
-#     ERROR: ResolutionImpossible  ->  docker build "exit code: 1"
-#
-# Mentioning a pre-release in the specifier (`>=2.5.0a0`) tells pip that
-# pre-releases are acceptable FOR THESE TWO PACKAGES ONLY, so the container's
-# own pre-release torch/torchaudio satisfy the requirement and pip keeps them
-# instead of trying to download a multi-GB stable CUDA build from PyPI.
+# Mentioning `a0` here tells pip that pre-releases are acceptable for these two
+# packages only, so the torch/torchaudio already installed in the image (which
+# match the constraint pin) always win, and pip never tries to download a
+# multi-GB stable CUDA stack that would break the container's CUDA ABI.
 # ---------------------------------------------------------------------------
 torch>=2.5.0a0
 torchaudio>=2.5.0a0
