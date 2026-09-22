@@ -38,12 +38,10 @@ ENV VOXCPM_PRELOAD=1
 ENV PYTHONPATH=/app
 
 # Python dependencies:
-# 1. Base image provides torch 2.5.1 + CUDA 12.4.
-# 2. Explicitly install torchaudio 2.5.1 with CUDA 12.4 wheels first so pip
-#    never downgrades torch or pulls incompatible CPU torchaudio when voxcpm installs.
+# NGC base image already includes PyTorch 2.7+ and torchaudio — do NOT reinstall them.
+# Only install worker-specific packages (runpod, voxcpm, edge-tts, soundfile, etc.)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torchaudio && \
     pip install --no-cache-dir -r /app/requirements.txt
 
 # Application worker code (isolated in /app so Network Volume mounts at
