@@ -83,22 +83,43 @@ RUN set -eux; \
     echo '--- original NGC pip constraint file (first 40 lines) ---'; \
     ls -ld /etc/pip 2>/dev/null || echo '(no /etc/pip directory in this image)'; \
     head -n 40 /etc/pip/constraint.txt 2>/dev/null || echo '(no /etc/pip/constraint.txt in this image)'; \
-    echo '--- torch import probe (non-fatal) ---'; \
+    echo '--- torch import probe (non-fatal; Step 1 uses metadata, not imports) ---'; \
     (python -c "import torch, torchaudio; print('torch import OK:', torch.__version__)") \
-        || echo '(torch/torchaudio import FAILED - traceback above; Step 1 will fail)'; \
+        || echo '(torch/torchaudio import FAILED - traceback above; confirmatory only, Step 1 does not depend on it)'; \
     (ls -l /usr/lib/python3*/EXTERNALLY-MANAGED 2>/dev/null && echo '(PEP 668 marker present)') || echo '(no PEP 668 externally-managed marker)'
 
 # --- Step 1: replace NGC's blanket pin file -------------------------------
 # Those pins cover every package the container was built with and make current
 # PyPI packages (gradio 6, datasets 3, funasr, modelscope, ...) unresolvable.
 # Keep only the two CUDA/ABI-critical pins, taken from the image itself.
-# mkdir -p guards against base images that ship no /etc/pip directory: a failed
-# shell redirection ("> /etc/pip/constraint.txt") aborts the build with exit 1
-# and NO python traceback, which is impossible to diagnose from the log.
-RUN set -eux; \
-    mkdir -p /etc/pip; \
-    python -c "import torch, torchaudio; print('torch==' + torch.__version__); print('torchaudio==' + torchaudio.__version__)" > /etc/pip/constraint.txt; \
-    echo '--- pip constraints in use (torch/torchaudio pinned to the image builds) ---'; \
+#
+# IMPORTANT (build failure 2026-09-23): reading versions via
+# `python -c "import torch, torchaudio"` KILLED the build - one of the two
+# imports exits 1 (traceback goes to stderr, which RunPod's log view hides).
+# Constraint files only need VERSION STRINGS, never an importable module, so
+# read them from installed package metadata instead (`pip show`). Every failure
+# below reports to STDOUT with a named stage so the next build is self-
+# explaining even when stderr is invisible. /etc/pip is guarded because a
+# failed shell redirection there aborts with exit 1 and NO output.
+RUN set -u; \
+    echo '=== STEP 1: generating pip constraint ==='; \
+    if [ -e /etc/pip ] && [ ! -d /etc/pip ]; then \
+        echo 'FATAL[stage=mkdir]: /etc/pip exists as a FILE, not a directory'; exit 1; \
+    fi; \
+    mkdir -p /etc/pip || { echo "FATAL[stage=mkdir]: mkdir -p /etc/pip rc=$?"; exit 1; }; \
+    python -m pip show torch > /tmp/_torch_meta.txt 2>&1 \
+        || { echo 'FATAL[stage=pip-show-torch]:'; cat /tmp/_torch_meta.txt; exit 1; }; \
+    TV="$(sed -n 's/^Version: //p' /tmp/_torch_meta.txt)"; \
+    [ -n "$TV" ] || { echo 'FATAL[stage=torch-version]: empty version from pip show'; exit 1; }; \
+    { echo "torch==$TV"; \
+      AV="$(python -m pip show torchaudio 2>/dev/null | sed -n 's/^Version: //p')"; \
+      if [ -n "$AV" ]; then echo "torchaudio==$AV"; \
+      else echo '# torchaudio not installed in base image - not pinned (harmless)'; fi; \
+    } > /etc/pip/constraint.txt \
+        || { echo "FATAL[stage=write-constraint]: rc=$?"; exit 1; }; \
+    [ -s /etc/pip/constraint.txt ] \
+        || { echo 'FATAL[stage=verify-constraint]: file is empty'; exit 1; }; \
+    echo '--- pip constraints in use (torch pinned to the image build) ---'; \
     cat /etc/pip/constraint.txt
 # Re-declare so the rewritten file is THE constraint file pip uses, even if the
 # base image did not export PIP_CONSTRAINT itself.
