@@ -11,16 +11,11 @@ runpod>=1.7.0
 # ---------------------------------------------------------------------------
 voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3
 
-# VoxCPM declares `torchcodec` as a dependency but NEVER imports it: a full
-# grep of the 2.0.3 sdist for "torchcodec" matches only pyproject.toml /
-# PKG-INFO / uv.lock — zero .py files.
-#
-# torchcodec is NOT pinned here because:
-#   - torchcodec 0.5 does NOT exist on PyPI (only 0.0.0 and 0.3.0 exist)
-#   - torchcodec 0.3.0 is ABI-incompatible with torch 2.7.1 (built for 2.4/2.5)
-#   - the latest series (0.16+) requires torch >= 2.11
-# The constraints.txt entry below installs a stub torchcodec==0.0.0 to satisfy
-# VoxCPM's dependency declaration without pulling in any real C++ extension.
+# torchcodec is intentionally NOT listed here and NOT installed.
+# VoxCPM 2.0.3 declares it in pyproject.toml but no .py file imports it.
+# The only PyPI entry (0.0.0.dev0) is a source-only tarball requiring FFmpeg
+# dev headers; there is no pre-built wheel. VoxCPM is installed --no-deps
+# in the Dockerfile to skip this unresolvable transitive dependency.
 
 edge-tts>=6.1.9
 soundfile>=0.12.1

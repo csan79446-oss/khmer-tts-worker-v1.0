@@ -63,17 +63,61 @@ COPY requirements.txt constraints.txt check_imports.py /app/
 # workarounds needed - a plain pip invocation just works here.
 RUN python -m pip install --no-cache-dir --upgrade pip
 
-# --- Step 2: worker requirements -------------------------------------------
-# -c constraints.txt pins the runtime stack to the versions inside voxcpm
-# 2.0.3's own uv.lock (incl. transformers==4.51.1 - the 5.x line breaks the
-# V1 tokenizer voxcpm 2.0.3 imports), so a rebuild can never pick up an
-# untested release that changed an API the engine relies on.
-RUN set -eux; \
-    python -m pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt; \
-    echo '--- key package versions now in the image ---'; \
-    python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope)='
+# --- Step 2: base worker requirements (everything except voxcpm) ---------------
+# Split into a separate layer from voxcpm so build errors are immediately visible
+# in RunPod's log (each RUN step is a distinct log section).
+# -c constraints.txt pins the full runtime stack to versions in voxcpm 2.0.3's
+# own uv.lock (incl. transformers==4.51.1 — the 5.x line breaks the V1 tokenizer).
+RUN python -m pip install --no-cache-dir \
+        runpod>=1.7.0 \
+        edge-tts>=6.1.9 \
+        soundfile>=0.12.1 \
+        numpy>=1.24.0 \
+        librosa>=0.10.1 \
+        pydantic>=2.0.0 \
+    -c /app/constraints.txt
 
-# --- Step 3: import checks --------------------------------------------------
+# --- Step 3: VoxCPM (installed with --no-deps) ---------------------------------
+# VoxCPM 2.0.3 declares `torchcodec` as a dependency in pyproject.toml, but
+# zero .py files in the package actually import it. The only installable
+# torchcodec on PyPI is 0.0.0.dev0 (a source-only tarball that requires FFmpeg
+# dev headers) — there is no pre-built wheel. Installing VoxCPM with --no-deps
+# skips torchcodec entirely; all other VoxCPM runtime deps (transformers,
+# modelscope, gradio, datasets, …) are already installed in Step 2 or ship in
+# the base image (torch, torchaudio).
+# torch / torchaudio ship in the base image and are detected as already-satisfied.
+RUN python -m pip install --no-cache-dir --no-deps \
+        "voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3"
+
+# --- Step 4: install remaining VoxCPM runtime deps (those not in Step 2) ------
+# These are declared by voxcpm's pyproject.toml and would normally be pulled in
+# automatically, but --no-deps skipped them. Install explicitly with constraints
+# so versions stay pinned to the tested set.
+RUN python -m pip install --no-cache-dir \
+        "transformers>=4.36.2" \
+        einops \
+        "gradio>=6,<7" \
+        inflect \
+        addict \
+        wetext \
+        "modelscope>=1.22.0" \
+        "datasets>=3,<4" \
+        huggingface-hub \
+        tqdm \
+        simplejson \
+        sortedcontainers \
+        funasr \
+        spaces \
+        argbind \
+        safetensors \
+    -c /app/constraints.txt
+
+# --- Step 5: version summary ---------------------------------------------------
+RUN echo '--- key package versions now in the image ---' \
+    && python -m pip list --format=freeze \
+       | grep -Ei '^(torch|torchaudio|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope)='
+
+# --- Step 6: import checks --------------------------------------------------
 # check_imports.py --strict exits 1 on ANY failed import (CORE or OPTIONAL)
 # with the full traceback on stdout, where RunPod's log view can see it.
 # Failing on the OPTIONAL voxcpm import is intentional: an image that cannot
