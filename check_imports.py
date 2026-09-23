@@ -49,6 +49,12 @@ def main() -> int:
     if not core_ok:
         print("CORE IMPORTS FAILED - this image is not usable.")
         return 1
+    if not optional_ok and strict:
+        print("=" * 72)
+        print("OPTIONAL IMPORT FAILED (strict mode) - build aborted.")
+        print("This usually means a dependency pin conflicts with voxcpm 2.0.3.")
+        print("Check the traceback for [FAIL] voxcpm / librosa above.")
+        return 1
     if not optional_ok:
         print("WARNING: librosa and/or voxcpm did not import.")
         print("         Real VoxCPM synthesis is unavailable; the worker will serve")

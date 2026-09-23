@@ -74,22 +74,35 @@ COPY requirements.txt constraints.txt check_imports.py /app/
 # --- Step 0: environment facts --------------------------------------------
 # If a later step fails, these lines make the cause readable from the build log
 # alone (python/pip version, the constraint file the image ships, PEP 668).
+# torch import is probed here WITHOUT failing the build, so a broken base image
+# shows its traceback here instead of dying silently in Step 1.
 RUN set -eux; \
     python -V; \
     python -m pip -V; \
     echo "PIP_CONSTRAINT=${PIP_CONSTRAINT:-<unset>}"; \
     echo '--- original NGC pip constraint file (first 40 lines) ---'; \
+    ls -ld /etc/pip 2>/dev/null || echo '(no /etc/pip directory in this image)'; \
     head -n 40 /etc/pip/constraint.txt 2>/dev/null || echo '(no /etc/pip/constraint.txt in this image)'; \
+    echo '--- torch import probe (non-fatal) ---'; \
+    (python -c "import torch, torchaudio; print('torch import OK:', torch.__version__)") \
+        || echo '(torch/torchaudio import FAILED - traceback above; Step 1 will fail)'; \
     (ls -l /usr/lib/python3*/EXTERNALLY-MANAGED 2>/dev/null && echo '(PEP 668 marker present)') || echo '(no PEP 668 externally-managed marker)'
 
 # --- Step 1: replace NGC's blanket pin file -------------------------------
 # Those pins cover every package the container was built with and make current
 # PyPI packages (gradio 6, datasets 3, funasr, modelscope, ...) unresolvable.
 # Keep only the two CUDA/ABI-critical pins, taken from the image itself.
+# mkdir -p guards against base images that ship no /etc/pip directory: a failed
+# shell redirection ("> /etc/pip/constraint.txt") aborts the build with exit 1
+# and NO python traceback, which is impossible to diagnose from the log.
 RUN set -eux; \
+    mkdir -p /etc/pip; \
     python -c "import torch, torchaudio; print('torch==' + torch.__version__); print('torchaudio==' + torchaudio.__version__)" > /etc/pip/constraint.txt; \
     echo '--- pip constraints in use (torch/torchaudio pinned to the image builds) ---'; \
     cat /etc/pip/constraint.txt
+# Re-declare so the rewritten file is THE constraint file pip uses, even if the
+# base image did not export PIP_CONSTRAINT itself.
+ENV PIP_CONSTRAINT=/etc/pip/constraint.txt
 
 # --- Step 2: pip itself ----------------------------------------------------
 RUN PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir --upgrade pip
@@ -104,9 +117,14 @@ RUN set -eux; \
     python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope)='
 
 # --- Step 4: import checks -------------------------------------------------
-# Core deps are fatal; librosa/voxcpm are reported with a full traceback and do
-# not abort the build (see check_imports.py for the reasoning).
-RUN python /app/check_imports.py
+# Run the dedicated check_imports.py script which:
+#   • tests CORE imports strictly (build fails fast with a readable traceback)
+#   • tests OPTIONAL imports (voxcpm, librosa) non-strictly (build still
+#     completes so we can see *which* import broke and fix it, rather than
+#     aborting with a silent "exit code: 1").
+# This replaces the old inline `python -c` smoke-test block that masked the
+# real failure behind `set -e` + a bare exit.
+RUN python /app/check_imports.py --strict
 
 # Application worker code (isolated in /app so Network Volume mounts at
 # /workspace or /runpod-volume NEVER mask or overwrite the handler scripts)
