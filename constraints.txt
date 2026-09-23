@@ -85,7 +85,11 @@ kaldiio==2.18.1
 kiwisolver==1.5.0
 lazy-loader==0.5
 librosa==0.11.0
-llvmlite==0.46.0
+# numba 0.67.0 + llvmlite 0.49.0 = the matched pair released Aug 2026.
+# numba 0.63.1 (Dec 2025) has an upper bound excluding numpy>=2.3,
+# but numpy==2.4.3 (Mar 2026) is pinned below — those two are incompatible.
+# numba 0.67.0 is the first release with explicit numpy 2.4/2.5 support.
+llvmlite==0.49.0
 markdown-it-py==4.0.0
 markupsafe==3.0.3
 matplotlib==3.10.8
@@ -100,7 +104,7 @@ multiprocess==0.70.16
 mypy-extensions==1.1.0
 networkx==3.6.1
 nodeenv==1.10.0
-numba==0.63.1
+numba==0.67.0
 numpy==2.4.3
 nvidia-cublas-cu12==12.8.4.1
 nvidia-cuda-cupti-cu12==12.8.90
