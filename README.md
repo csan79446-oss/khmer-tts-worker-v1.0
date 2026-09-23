@@ -24,8 +24,8 @@ Khmer TTS Studio Desktop Application.
 runpod_worker/
 ├── handler.py          # RunPod serverless entrypoint (raises on failure)
 ├── model_engine.py     # REAL VoxCPM engine + labelled Edge-TTS fallback
-├── Dockerfile          # NVIDIA NGC PyTorch 25.04 base (CUDA 12.9, Blackwell sm_100)
-├── requirements.txt    # runpod, voxcpm (pinned tag), torchcodec (pinned), edge-tts, soundfile, librosa
+├── Dockerfile          # Official pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime base (CUDA 12.8, Blackwell sm_100)
+├── requirements.txt    # Minimal verified runtime deps; VoxCPM 2.0.3 installed separately (--no-deps)
 ├── .dockerignore
 ├── test_input.json     # Test payload with Khmer text
 ├── test_local.py       # Local verification (uses Edge-TTS fallback if voxcpm absent)

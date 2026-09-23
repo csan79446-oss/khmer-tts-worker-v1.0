@@ -1,144 +1,116 @@
 # ---------------------------------------------------------------------------
-# Khmer TTS RunPod Serverless worker image.
+# Khmer TTS — RunPod Serverless worker image (VoxCPM2 engine)
 #
 # Base: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime (OFFICIAL PyTorch image)
 #   Python 3.11 | PyTorch 2.7.1 stable | CUDA 12.8 | cuDNN 9
-#   CUDA 12.8 ships Blackwell (sm_100) kernels, so B200/GB200 pods work too.
+#   - CUDA 12.8 kernels cover Blackwell (sm_100) B200/GB200 pods AND older
+#     GPUs (RTX 30xx/40xx, A100, H100, L4, ...). One image, every RunPod GPU.
+#   - torch + torchaudio ship INSIDE this image and are NEVER reinstalled
+#     (pip sees them as already satisfied; the CUDA ABI is never touched).
 #
-# Design philosophy:
-#   - NO constraints.txt. That file contained phantom version numbers that
-#     caused every build to fail. pip is allowed to resolve freely.
-#   - The ONLY hard pins are the ones that are genuinely known to break:
-#       * transformers<5   -- VoxCPM 2.0.3 uses V1 tokenizer APIs removed in 5.x
-#       * VoxCPM @ tag     -- pinned to a specific release tag for reproducibility
-#   - VoxCPM is installed with --no-deps because its pyproject.toml declares
-#     `torchcodec` which has NO pre-built wheel for torch 2.7.x. All other
-#     VoxCPM runtime deps are installed explicitly in a later step.
-#   - torch / torchaudio ship inside the base image and are never reinstalled.
+# Why this build cannot fail the way previous attempts did:
+#   1. NO constraints.txt / blanket pins. pip resolves freely; the ONLY pins
+#      are ones verified against the voxcpm 2.0.3 source tree:
+#        * transformers>=4.51.1,<5  (5.x removed the V1 tokenizer API that
+#          voxcpm's LlamaTokenizerFast usage relies on)
+#        * voxcpm @ tag 2.0.3       (exact release, reproducible rebuilds)
+#        * numpy<3, librosa<0.12    (guard against future API drift)
+#   2. MINIMAL dependency set. `import voxcpm` at tag 2.0.3 requires ONLY:
+#      numpy, librosa, einops, pydantic, safetensors, tqdm, transformers,
+#      huggingface-hub (+ regex/inflect/wetext for the lazy text normalizer).
+#      The pyproject.toml entries torchcodec / gradio / datasets / funasr /
+#      modelscope / spaces / argbind are NOT imported by the core package and
+#      are the historical cause of ResolutionImpossible build failures:
+#        - torchcodec: only a 0.0.0.dev0 source tarball exists, no wheel for
+#          torch 2.7.x -> unresolvable
+#        - gradio 6 / datasets 3 / funasr / modelscope: heavy resolver-conflict
+#          magnets with zero runtime benefit for this worker
+#   3. VoxCPM is installed with --no-deps (skips exactly those), then every
+#      real runtime dependency is installed explicitly from requirements.txt.
+#   4. Build-time import gate (check_imports.py --strict) fails the build with
+#      full tracebacks if any core import is broken — never a silent
+#      "exit code: 1".
+#   5. The optional reference-audio denoiser (VOXCPM_DENOISER=1) extras are
+#      installed best-effort: if that step fails the build still succeeds and
+#      the worker runs normally with VOXCPM_DENOISER=0 (the default).
 # ---------------------------------------------------------------------------
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
 # ---------------------------------------------------------------------------
 # System dependencies
-#   ffmpeg        -- audio encode/decode used by librosa, soundfile, edge-tts
-#   libsndfile1   -- soundfile C library
-#   git           -- needed so pip can clone VoxCPM from GitHub
-#   build-essential -- gcc/g++ for torch._inductor (torch.compile) if enabled
+#   ffmpeg           -- audio decode/encode used by librosa / edge-tts
+#   libsndfile1(-dev)-- soundfile C library
+#   git              -- pip needs it to clone voxcpm from GitHub
+#   build-essential  -- gcc/g++ for torch.compile (VOXCPM_OPTIMIZE=1)
+#   ca-certificates, curl -- TLS sanity + debugging
 # ---------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
         build-essential \
-        ffmpeg \
-        libsndfile1 \
-        libsndfile1-dev \
-        git \
+        ca-certificates \
         curl \
-    && rm -rf /var/lib/apt/lists/*
+        ffmpeg \
+        git \
+        libsndfile1 \
+        libsndfile1-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Runtime environment variables
+# Runtime environment (matches model_engine.py and DEPLOY_GUIDE.md)
 # ---------------------------------------------------------------------------
-ENV HF_HOME=/workspace/models/hf_cache
-ENV MODEL_PATH=/workspace/models
-ENV VOXCPM_MODEL_ID=openbmb/VoxCPM2
-ENV VOXCPM_DEVICE=auto
-ENV VOXCPM_TIMESTEPS=10
-ENV VOXCPM_PRELOAD=1
-ENV PYTHONPATH=/app
-# Allow pip to install into conda-managed Python (PEP 668 override)
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV HF_HOME=/workspace/models/hf_cache \
+    MODEL_PATH=/workspace/models \
+    VOXCPM_MODEL_ID=openbmb/VoxCPM2 \
+    VOXCPM_DEVICE=auto \
+    VOXCPM_TIMESTEPS=10 \
+    VOXCPM_PRELOAD=1 \
+    PYTHONPATH=/app
 
-# Copy only the files needed at build time (cached separately from app code)
-COPY check_imports.py /app/
+# Build-time files only (separate layers so app-code changes don't bust them)
+COPY check_imports.py /app/check_imports.py
+COPY requirements.txt /app/requirements.txt
 
-# ---------------------------------------------------------------------------
-# Step 1: upgrade pip
-# ---------------------------------------------------------------------------
-RUN python -m pip install --no-cache-dir --upgrade pip
+# --- Step 1: pip toolchain ---------------------------------------------------
+RUN set -eux; python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# ---------------------------------------------------------------------------
-# Step 2: core worker runtime dependencies (freely resolved by pip)
-#
-#   runpod       -- serverless SDK
-#   edge-tts     -- labelled fallback TTS (requires no GPU)
-#   soundfile    -- WAV encode/decode in handler.py / model_engine.py
-#   numpy        -- audio array processing
-#   librosa      -- audio resampling for voice reference preprocessing
-#   pydantic     -- input validation
-#   "transformers>=4,<5"  -- VoxCPM 2.0.3 requires the 4.x API; 5.x removed
-#                            the V1 tokenizer that voxcpm uses. This is the
-#                            ONLY hard upper-bound pin we need.
-# ---------------------------------------------------------------------------
-RUN python -m pip install --no-cache-dir \
-        "runpod>=1.7.0" \
-        "edge-tts>=6.1.9" \
-        "soundfile>=0.12.1" \
-        "numpy>=1.24.0" \
-        "librosa>=0.10.1" \
-        "pydantic>=2.0.0" \
-        "transformers>=4.36.2,<5"
+# --- Step 2: verified runtime dependencies (single source of truth) ----------
+# Every package here is one actually imported by handler.py / model_engine.py
+# / the voxcpm 2.0.3 import chain. Nothing speculative.
+RUN set -eux; \
+    python -m pip install --no-cache-dir -r /app/requirements.txt; \
+    python -c "import torch, torchaudio; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| cuda', torch.version.cuda)"
 
-# ---------------------------------------------------------------------------
-# Step 3: install VoxCPM itself (--no-deps to skip unresolvable torchcodec)
-#
-#   VoxCPM 2.0.3 pyproject.toml lists `torchcodec` as a dependency, but:
-#     - No .py file in VoxCPM ever imports torchcodec
-#     - The only PyPI entry is 0.0.0.dev0, a source-only tarball that needs
-#       FFmpeg C headers to compile — those are NOT in the runtime base image
-#   Using --no-deps skips torchcodec. All other real VoxCPM deps (torch,
-#   torchaudio, transformers, einops, ...) are already installed above or
-#   ship inside the base image.
-# ---------------------------------------------------------------------------
-RUN python -m pip install --no-cache-dir --no-deps \
+# --- Step 3: VoxCPM 2.0.3 itself (--no-deps; see header for why) -------------
+RUN set -eux; \
+    python -m pip install --no-cache-dir --no-deps \
         "voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3"
 
-# ---------------------------------------------------------------------------
-# Step 4: remaining VoxCPM runtime dependencies
-#   (declared in VoxCPM's pyproject.toml; skipped by --no-deps above)
-#   torch / torchaudio are intentionally omitted — they ship in the base image.
-# ---------------------------------------------------------------------------
-RUN python -m pip install --no-cache-dir \
-        einops \
-        "gradio>=6,<7" \
-        inflect \
-        addict \
-        wetext \
-        "modelscope>=1.22.0" \
-        "datasets>=3,<4" \
-        huggingface-hub \
-        tqdm \
-        simplejson \
-        sortedcontainers \
-        funasr \
-        spaces \
-        argbind \
-        safetensors
+# --- Step 4 (OPTIONAL, non-fatal): denoiser extras ---------------------------
+# Only needed when VOXCPM_DENOISER=1 (reference-audio noise suppression via
+# ModelScope's zipenhancer). Failure here must never fail the build.
+RUN python -m pip install --no-cache-dir "modelscope>=1.22.0" funasr \
+    || echo "WARNING: optional denoiser packages (modelscope/funasr) not installed - VOXCPM_DENOISER=1 unavailable; worker runs normally with VOXCPM_DENOISER=0."
+
+# --- Step 5: build-time import gate (strict) ---------------------------------
+# CORE imports (torch, torchaudio, numpy, soundfile, edge_tts, runpod) and
+# OPTIONAL imports (librosa, voxcpm) must ALL pass, else the build aborts with
+# full tracebacks in the RunPod build log.
+RUN set -eux; python /app/check_imports.py --strict
 
 # ---------------------------------------------------------------------------
-# Step 5: print installed key package versions (informational, never fails)
-# ---------------------------------------------------------------------------
-RUN echo "=== Key package versions in this image ===" \
-    && python -m pip list --format=freeze \
-       | { grep -Ei "^(torch|torchaudio|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope|pydantic|safetensors)=" || true; }
-
-# ---------------------------------------------------------------------------
-# Step 6: build-time import gate
-#   Exits 1 if any CORE import fails (torch, numpy, soundfile, runpod, ...).
-#   Exits 1 in --strict mode if voxcpm or librosa fail.
-#   Full tracebacks are printed to stdout so RunPod's log shows the exact error.
-# ---------------------------------------------------------------------------
-RUN python /app/check_imports.py --strict
-
-# ---------------------------------------------------------------------------
-# Application code (copied AFTER pip steps so code changes don't bust cache)
+# Application code last (code edits don't invalidate the pip layers above)
 # ---------------------------------------------------------------------------
 COPY . /app/
 
-# Ensure model volume mount points exist
-RUN mkdir -p /workspace/models /runpod-volume/models
+# Model volume mount points (RunPod Network Volume mounts at /runpod-volume)
+RUN set -eux; mkdir -p /workspace/models /runpod-volume/models
 
 CMD ["python", "-u", "/app/handler.py"]

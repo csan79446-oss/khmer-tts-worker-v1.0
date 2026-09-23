@@ -1,29 +1,48 @@
-runpod>=1.7.0
-
 # ---------------------------------------------------------------------------
-# VoxCPM — pinned to an exact release tag so a RunPod rebuild can never pick up
-# an untested upstream dependency change. (An unpinned git URL rebuilds
-# whatever OpenBMB's `main` happens to be that day — that is how a build that
-# worked yesterday starts failing today.)
+# Khmer TTS RunPod worker — verified runtime dependencies.
 #
-# 2.0.3 = latest tagged release; exposes the VoxCPM2 API used by model_engine.py
-#         (VoxCPM(...).generate(..., reference_wav_path=...)).
-# ---------------------------------------------------------------------------
-voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3
-
-# torchcodec is intentionally NOT listed here and NOT installed.
-# VoxCPM 2.0.3 declares it in pyproject.toml but no .py file imports it.
-# The only PyPI entry (0.0.0.dev0) is a source-only tarball requiring FFmpeg
-# dev headers; there is no pre-built wheel. VoxCPM is installed --no-deps
-# in the Dockerfile to skip this unresolvable transitive dependency.
-
-edge-tts>=6.1.9
-soundfile>=0.12.1
-numpy>=1.24.0
-librosa>=0.10.1
-pydantic>=2.0.0
-
+# This file is the SINGLE SOURCE OF TRUTH; runpod_worker/Dockerfile installs
+# exactly this set (Step 2), then VoxCPM 2.0.3 separately with --no-deps.
+#
+# Every entry below is actually imported at runtime by handler.py,
+# model_engine.py, or the voxcpm 2.0.3 import chain
+# (voxcpm/__init__.py -> core.py -> model/{voxcpm,voxcpm2,utils}.py):
+#   numpy, librosa, einops, pydantic, safetensors, tqdm, transformers,
+#   huggingface-hub (pulled in by transformers itself)
+# plus the lazy text normalizer (voxcpm/utils/text_normalize.py):
+#   regex, inflect, wetext
+#
+# Deliberately NOT listed (declared in voxcpm's pyproject.toml but NEVER
+# imported by the core package — they only caused build failures):
+#   torchcodec  (no wheel exists for torch 2.7.x; source-only 0.0.0.dev0)
+#   gradio / datasets / funasr / modelscope / spaces / argbind / addict /
+#   simplejson / sortedcontainers / matplotlib
+# modelscope+funasr are installed best-effort in Dockerfile Step 4 because
+# ONLY the optional VOXCPM_DENOISER=1 feature needs them.
+#
 # torch / torchaudio intentionally NOT listed: they ship inside the base image
-# (pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime, stable builds) and pip detects
-# them as already-satisfied, so the container's CUDA ABI is never touched.
+# (pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime) and pip detects them as
+# already satisfied, so the container's CUDA ABI is never touched.
+# ---------------------------------------------------------------------------
+
+# --- worker runtime ---
+runpod>=1.7.0,<2
+edge-tts>=6.1.9,<8
+soundfile>=0.12.1
+
+# --- voxcpm 2.0.3 import chain ---
+numpy>=1.24.0,<3
+librosa>=0.10.1,<0.12
+einops
+pydantic>=2.0.0,<3
+safetensors
+tqdm
+# transformers 5.x removed the V1 tokenizer API voxcpm 2.0.3 uses
+# (LlamaTokenizerFast). 4.51.1 is the version in voxcpm 2.0.3's own lockfile.
+transformers>=4.51.1,<5
+
+# --- voxcpm lazy text normalizer (utils/text_normalize.py) ---
+regex
+inflect
+wetext
 
