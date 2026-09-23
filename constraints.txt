@@ -8,7 +8,7 @@
 #
 # Deliberately NOT pinned here:
 #   torch / torchaudio - provided by the official PyTorch base image (stable 2.7.1)
-#   torchcodec          - pinned in requirements.txt (must match that torch)
+#   torchcodec          - pinned here as 0.0.0 stub (satisfies VoxCPM dep declaration;
 #   runpod, edge-tts    - our own runtime deps, not part of voxcpm's lock
 # ---------------------------------------------------------------------------
 addict==2.4.0
@@ -99,7 +99,7 @@ multiprocess==0.70.16
 mypy-extensions==1.1.0
 networkx==3.6.1
 nodeenv==1.10.0
-numba==0.64.0
+numba==0.63.1
 numpy==2.4.3
 nvidia-cublas-cu12==12.8.4.1
 nvidia-cuda-cupti-cu12==12.8.90
@@ -179,6 +179,12 @@ tokenizers==0.21.1
 tomli==2.4.0
 tomlkit==0.13.3
 torch-complex==0.4.4
+# torchcodec==0.0.0 is the stub wheel (pure-Python, no C++ extension).
+# VoxCPM 2.0.3 declares torchcodec as a dep but zero .py files import it.
+# torchcodec 0.5 does NOT exist on PyPI; 0.3.0 is ABI-incompatible with
+# torch 2.7.1 (built for 2.4/2.5); 0.16+ requires torch >= 2.11.
+# The 0.0.0 stub satisfies the declaration without any CUDA/ABI binding.
+torchcodec==0.0.0
 tqdm==4.67.3
 # transformers 5.x (5.3.0 in voxcpm's own uv.lock) breaks VoxCPM 2.0.3:
 # voxcpm's V1 tokenizer relies on transformers APIs that were removed in 5.x,
