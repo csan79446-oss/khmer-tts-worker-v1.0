@@ -96,8 +96,8 @@ RUN set -eux; \
 # --- Step 4 (OPTIONAL, non-fatal): denoiser extras ---------------------------
 # Only needed when VOXCPM_DENOISER=1 (reference-audio noise suppression via
 # ModelScope's zipenhancer). Failure here must never fail the build.
-RUN python -m pip install --no-cache-dir "modelscope>=1.22.0" funasr \
-    || echo "WARNING: optional denoiser packages (modelscope/funasr) not installed - VOXCPM_DENOISER=1 unavailable; worker runs normally with VOXCPM_DENOISER=0."
+RUN python -m pip install --no-cache-dir "modelscope>=1.22.0" funasr addict \
+    || echo "WARNING: optional denoiser packages (modelscope/funasr/addict) not installed - VOXCPM_DENOISER=1 unavailable; worker runs normally with VOXCPM_DENOISER=0."
 
 # --- Step 5: build-time import gate (strict) ---------------------------------
 # CORE imports (torch, torchaudio, numpy, soundfile, edge_tts, runpod) and
