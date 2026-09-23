@@ -7,7 +7,7 @@
 # importable and reproducible for every RunPod rebuild.
 #
 # Deliberately NOT pinned here:
-#   torch / torchaudio - provided by the NGC base image (pre-release build)
+#   torch / torchaudio - provided by the official PyTorch base image (stable 2.7.1)
 #   torchcodec          - pinned in requirements.txt (must match that torch)
 #   runpod, edge-tts    - our own runtime deps, not part of voxcpm's lock
 # ---------------------------------------------------------------------------

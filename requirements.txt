@@ -14,10 +14,10 @@ voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@2.0.3
 # VoxCPM declares `torchcodec` (unpinned) but NEVER imports it: a full grep of
 # the 2.0.3 sdist for "torchcodec" matches only pyproject.toml / PKG-INFO /
 # uv.lock — zero .py files. Left unpinned, pip resolves torchcodec 0.16, which
-# is built for torch >= 2.11 and cannot load against the torch 2.7 build that
-# ships inside nvcr.io/nvidia/pytorch:25.04-py3. Pin the last release built for
-# torch 2.7 (torchcodec 0.5, per PyTorch's compatibility table) so the installed
-# wheel always matches the interpreter's torch ABI.
+# is built for torch >= 2.11 and cannot load against the stable torch 2.7.1
+# build that ships inside pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime. Pin
+# the last release built for torch 2.7 (torchcodec 0.5, per PyTorch's
+# compatibility table) so the wheel always matches the interpreter's torch ABI.
 torchcodec==0.5
 
 edge-tts>=6.1.9
@@ -26,27 +26,7 @@ numpy>=1.24.0
 librosa>=0.10.1
 pydantic>=2.0.0
 
-# ---------------------------------------------------------------------------
-# WHY THESE TWO LINES EXIST (do not delete them)
-#
-# The worker takes PyTorch from the NGC base image: torch and torchaudio are
-# NVIDIA *pre-release* builds (2.7.0a0+79aa17489c), and since NGC 25.03 the
-# image pins them through /etc/pip/constraint.txt.
-#
-# A specifier that never mentions a pre-release (e.g. VoxCPM's `torch>=2.5.0`)
-# lets pip consider only stable candidates whenever it must select from an
-# index. Verified against PyPI metadata:
-#   * torchaudio 2.7.0  declares `torch==2.7.0`
-#   * torchaudio 2.11.0 declares `torch==2.11.0`
-# Neither can ever be satisfied by the pinned pre-release build, so pip ends
-# the build with `ResolutionImpossible` -> RunPod reports "exit code: 1".
-# That is exactly what the removed `pip install torchaudio` step used to do.
-#
-# Mentioning `a0` here tells pip that pre-releases are acceptable for these two
-# packages only, so the torch/torchaudio already installed in the image (which
-# match the constraint pin) always win, and pip never tries to download a
-# multi-GB stable CUDA stack that would break the container's CUDA ABI.
-# ---------------------------------------------------------------------------
-torch>=2.5.0a0
-torchaudio>=2.5.0a0
+# torch / torchaudio intentionally NOT listed: they ship inside the base image
+# (pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime, stable builds) and pip detects
+# them as already-satisfied, so the container's CUDA ABI is never touched.
 

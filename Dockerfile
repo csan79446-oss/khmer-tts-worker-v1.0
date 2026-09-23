@@ -1,8 +1,20 @@
-# NVIDIA NGC PyTorch 25.04 — PyTorch 2.7.0 (NVIDIA build 2.7.0a0+79aa17489c, Python 3.12)
-# with CUDA 12.9 + Blackwell (sm_100) support.
-# Use this image when RunPod assigns Blackwell GPUs (B200/GB200, compute capability sm_100).
-# For older GPUs (RTX 4090/A100/H100), pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime also works.
-FROM nvcr.io/nvidia/pytorch:25.04-py3
+# ---------------------------------------------------------------------------
+# Khmer TTS RunPod Serverless worker image.
+#
+# Base: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime (OFFICIAL PyTorch image)
+#   PyTorch 2.7.1 stable build | CUDA 12.8 | cuDNN 9
+#   CUDA 12.8 ships Blackwell (sm_100) kernels, so B200/GB200 pods work too.
+#
+# Why NOT the previous NGC base (nvcr.io/nvidia/pytorch:25.04-py3)?
+#   NGC ships a PRE-RELEASE torch (2.7.0a0+<hash>) and exports
+#   PIP_CONSTRAINT=/etc/pip/constraint.txt pinning EVERY package in the image.
+#   That pin file made current PyPI packages unresolvable, and the pre-release
+#   torch could never satisfy torchaudio's exact stable pin (torch==2.7.0),
+#   so pip died with "ResolutionImpossible" and RunPod reported "exit code: 1"
+#   on three consecutive builds. On the official stable image none of those
+#   failure modes exist, so every NGC workaround has been deleted here.
+# ---------------------------------------------------------------------------
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -31,120 +43,42 @@ ENV MODEL_PATH=/workspace/models
 # with true zero-shot cloning via reference_wav_path (alone, no transcript).
 # If a legacy 1.x build ever ends up installed instead, the worker detects it
 # at load time and auto-downgrades to 'openbmb/VoxCPM-0.5B' (16 kHz).
-# Mirror repos (e.g. Tha456/VoxCPM2) also work as VOXCPM_MODEL_ID values.
 ENV VOXCPM_MODEL_ID=openbmb/VoxCPM2
 ENV VOXCPM_DEVICE=auto
 ENV VOXCPM_TIMESTEPS=10
 ENV VOXCPM_PRELOAD=1
 ENV PYTHONPATH=/app
 
-# ---------------------------------------------------------------------------
-# Python dependencies
-#
-# The NGC image already ships PyTorch, torchaudio and the whole CUDA stack, so
-# this step only adds the worker's own packages. Two traps live here:
-#
-#   1) Since NGC 25.03 the container exports PIP_CONSTRAINT=/etc/pip/constraint.txt
-#      — an exact-pin file listing EVERY package the image was built with. Each
-#      pip run inside the image inherits it, which makes current PyPI packages
-#      (gradio 6, datasets 3, funasr, modelscope, huggingface-hub, ...)
-#      unresolvable and aborts the build with "exit code: 1" (the real pip error
-#      scrolls by above that line).
-#      -> We REWRITE that file with a minimal constraint set that only pins the
-#         two CUDA/ABI-critical packages to the builds already in the image.
-#         pip can therefore never silently re-download a multi-GB PyPI
-#         torch/torchaudio (the classic cause of these failed builds), while
-#         every other package resolves normally.
-#
-#   2) Never add `pip install torchaudio` (or torch) to this image. PyPI's
-#      torchaudio declares an exact torch pin (torchaudio 2.7.0 -> torch==2.7.0,
-#      2.11.0 -> torch==2.11.0), which the container's pre-release build
-#      (2.7.0a0+<hash>) can never satisfy - and the constraint file above
-#      forbids installing any other torch, so pip ends with
-#      "ResolutionImpossible" and the builder reports "exit code: 1".
-#      The image's own torchaudio already satisfies requirements.txt.
-# ---------------------------------------------------------------------------
 # Pip may be asked to install into a python that is marked "externally managed"
 # (PEP 668). Inside a container that is exactly what we want, and the setting is
 # a no-op when the marker is absent.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
+# Dependency manifests + the build-time import gate are copied first so this
+# layer stays cached across handler-only changes.
 COPY requirements.txt constraints.txt check_imports.py /app/
 
-# --- Step 0: environment facts --------------------------------------------
-# If a later step fails, these lines make the cause readable from the build log
-# alone (python/pip version, the constraint file the image ships, PEP 668).
-# torch import is probed here WITHOUT failing the build, so a broken base image
-# shows its traceback here instead of dying silently in Step 1.
-RUN set -eux; \
-    python -V; \
-    python -m pip -V; \
-    echo "PIP_CONSTRAINT=${PIP_CONSTRAINT:-<unset>}"; \
-    echo '--- original NGC pip constraint file (first 40 lines) ---'; \
-    ls -ld /etc/pip 2>/dev/null || echo '(no /etc/pip directory in this image)'; \
-    head -n 40 /etc/pip/constraint.txt 2>/dev/null || echo '(no /etc/pip/constraint.txt in this image)'; \
-    echo '--- torch import probe (non-fatal; Step 1 uses metadata, not imports) ---'; \
-    (python -c "import torch, torchaudio; print('torch import OK:', torch.__version__)") \
-        || echo '(torch/torchaudio import FAILED - traceback above; confirmatory only, Step 1 does not depend on it)'; \
-    (ls -l /usr/lib/python3*/EXTERNALLY-MANAGED 2>/dev/null && echo '(PEP 668 marker present)') || echo '(no PEP 668 externally-managed marker)'
+# --- Step 1: pip itself -----------------------------------------------------
+# Stable base image: no NGC PIP_CONSTRAINT to fight and no metadata-probing
+# workarounds needed - a plain pip invocation just works here.
+RUN python -m pip install --no-cache-dir --upgrade pip
 
-# --- Step 1: replace NGC's blanket pin file -------------------------------
-# Those pins cover every package the container was built with and make current
-# PyPI packages (gradio 6, datasets 3, funasr, modelscope, ...) unresolvable.
-# Keep only the two CUDA/ABI-critical pins, taken from the image itself.
-#
-# IMPORTANT (build failure 2026-09-23): reading versions via
-# `python -c "import torch, torchaudio"` KILLED the build - one of the two
-# imports exits 1 (traceback goes to stderr, which RunPod's log view hides).
-# Constraint files only need VERSION STRINGS, never an importable module, so
-# read them from installed package metadata instead (`pip show`). Every failure
-# below reports to STDOUT with a named stage so the next build is self-
-# explaining even when stderr is invisible. /etc/pip is guarded because a
-# failed shell redirection there aborts with exit 1 and NO output.
-RUN set -u; \
-    echo '=== STEP 1: generating pip constraint ==='; \
-    if [ -e /etc/pip ] && [ ! -d /etc/pip ]; then \
-        echo 'FATAL[stage=mkdir]: /etc/pip exists as a FILE, not a directory'; exit 1; \
-    fi; \
-    mkdir -p /etc/pip || { echo "FATAL[stage=mkdir]: mkdir -p /etc/pip rc=$?"; exit 1; }; \
-    python -m pip show torch > /tmp/_torch_meta.txt 2>&1 \
-        || { echo 'FATAL[stage=pip-show-torch]:'; cat /tmp/_torch_meta.txt; exit 1; }; \
-    TV="$(sed -n 's/^Version: //p' /tmp/_torch_meta.txt)"; \
-    [ -n "$TV" ] || { echo 'FATAL[stage=torch-version]: empty version from pip show'; exit 1; }; \
-    { echo "torch==$TV"; \
-      AV="$(python -m pip show torchaudio 2>/dev/null | sed -n 's/^Version: //p')"; \
-      if [ -n "$AV" ]; then echo "torchaudio==$AV"; \
-      else echo '# torchaudio not installed in base image - not pinned (harmless)'; fi; \
-    } > /etc/pip/constraint.txt \
-        || { echo "FATAL[stage=write-constraint]: rc=$?"; exit 1; }; \
-    [ -s /etc/pip/constraint.txt ] \
-        || { echo 'FATAL[stage=verify-constraint]: file is empty'; exit 1; }; \
-    echo '--- pip constraints in use (torch pinned to the image build) ---'; \
-    cat /etc/pip/constraint.txt
-# Re-declare so the rewritten file is THE constraint file pip uses, even if the
-# base image did not export PIP_CONSTRAINT itself.
-ENV PIP_CONSTRAINT=/etc/pip/constraint.txt
-
-# --- Step 2: pip itself ----------------------------------------------------
-RUN PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir --upgrade pip
-
-# --- Step 3: worker requirements ------------------------------------------
+# --- Step 2: worker requirements -------------------------------------------
 # -c constraints.txt pins the runtime stack to the versions inside voxcpm
-# 2.0.3's own uv.lock, so a rebuild can never pick up an untested release that
-# changed an API the engine relies on.
+# 2.0.3's own uv.lock (incl. transformers==4.51.1 - the 5.x line breaks the
+# V1 tokenizer voxcpm 2.0.3 imports), so a rebuild can never pick up an
+# untested release that changed an API the engine relies on.
 RUN set -eux; \
-    PIP_CONSTRAINT=/etc/pip/constraint.txt python -m pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt; \
+    python -m pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt; \
     echo '--- key package versions now in the image ---'; \
     python -m pip list --format=freeze | grep -Ei '^(torch|torchaudio|torchcodec|voxcpm|transformers|huggingface|datasets|numpy|librosa|numba|soundfile|edge-tts|runpod|modelscope)='
 
-# --- Step 4: import checks -------------------------------------------------
-# Run the dedicated check_imports.py script which:
-#   • tests CORE imports strictly (build fails fast with a readable traceback)
-#   • tests OPTIONAL imports (voxcpm, librosa) non-strictly (build still
-#     completes so we can see *which* import broke and fix it, rather than
-#     aborting with a silent "exit code: 1").
-# This replaces the old inline `python -c` smoke-test block that masked the
-# real failure behind `set -e` + a bare exit.
+# --- Step 3: import checks --------------------------------------------------
+# check_imports.py --strict exits 1 on ANY failed import (CORE or OPTIONAL)
+# with the full traceback on stdout, where RunPod's log view can see it.
+# Failing on the OPTIONAL voxcpm import is intentional: an image that cannot
+# import voxcpm would silently degrade every production job to the labelled
+# Edge-TTS fallback, which is NOT shippable.
 RUN python /app/check_imports.py --strict
 
 # Application worker code (isolated in /app so Network Volume mounts at
