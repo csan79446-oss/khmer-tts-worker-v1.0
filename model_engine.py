@@ -300,25 +300,41 @@ def build_pretrained_kwargs(voxcpm_cls, load_denoiser: bool, optimize: bool, dev
     ]
 
     def accepts(name: str) -> bool:
-        # from_pretrained may be a thin *args/**kwargs forwarder whose public
-        # signature hides the real contract; in that case consult __init__.
-        # Only an explicit named parameter proves acceptance - a wrong kwarg
+        # A signature's EXPLICIT named parameters always prove acceptance -
+        # even on a **kwargs-forwarding wrapper like voxcpm 2.x's
+        # from_pretrained(model_id, load_denoiser=True, ..., **kwargs), whose
+        # own signature names load_denoiser/optimize/device. Previously such
+        # wrappers were skipped wholesale (has_varkw -> continue), so
+        # 'load_denoiser' was silently dropped and from_pretrained's default
+        # load_denoiser=True then imported the optional modelscope/funasr
+        # denoiser chain on every model load even with VOXCPM_DENOISER=0 -
+        # the production "No module named 'addict'" crash. Only a signature
+        # with NO explicit parameters (pure *args/**kwargs) hides its
+        # contract; skip those and consult the next signature (e.g. __init__).
+        # Unknown kwargs must never be forwarded blindly: a wrong kwarg
         # raises TypeError only AFTER the multi-GB weights have been
-        # downloaded, so unknown kwargs must never be forwarded blindly.
+        # downloaded - hence the load-time shrink-and-retry below.
         for info in infos:
             if info is None:
                 continue
             names, has_varkw = info
-            if has_varkw:
-                continue  # forwarding wrapper: real contract not visible here
+            if has_varkw and name not in names:
+                continue  # forwarding wrapper: param not proven here
             return name in names
-        # Both signatures unknown (or pure *args/**kwargs): optimistically
-        # pass through; the load-time retry below drops rejected kwargs.
+        # Both signatures opaque (pure *args/**kwargs): optimistically pass
+        # through; the load-time retry below drops rejected kwargs.
         return True
 
     kwargs = {}
     if accepts("load_denoiser"):
         kwargs["load_denoiser"] = load_denoiser
+    # NOTE: never pass 'enable_denoiser' through from_pretrained's **kwargs -
+    # voxcpm 2.x's from_pretrained() already forwards the denoiser flag to
+    # __init__ explicitly (enable_denoiser=load_denoiser), so an extra
+    # enable_denoiser kwarg raises TypeError "got multiple values for
+    # keyword argument". Passing load_denoiser (its own named param) is the
+    # only safe route; if no signature names it, the denoiser-retry in
+    # _load_model() degrades gracefully instead.
     if accepts("optimize"):
         kwargs["optimize"] = optimize
     elif accepts("optimize_bn"):
@@ -356,6 +372,15 @@ def _pretrained_load_with_retry(voxcpm_cls, model_id: str, kwargs: dict):
             return voxcpm_cls.from_pretrained(model_id, **current), current
         except TypeError as ex:
             m = re.search(r"unexpected keyword argument '(\w+)'", str(ex))
+            if not m:
+                # Also recover from "got multiple values for keyword argument
+                # 'X'" - happens when introspection missed that a forwarding
+                # from_pretrained() already passes a param explicitly (e.g.
+                # enable_denoiser in its **kwargs colliding with its own
+                # load_denoiser forwarding).
+                m = re.search(
+                    r"got multiple values for keyword argument '(\w+)'", str(ex)
+                )
             if not m or m.group(1) not in current:
                 raise
             dropped = m.group(1)
@@ -386,6 +411,28 @@ def _looks_like_compile_error(ex: Exception) -> bool:
         "torch._dynamo",
         "torch dynamo",
         "triton",
+    )
+    return any(marker in msg for marker in markers)
+
+
+def _looks_like_denoiser_import_error(ex: Exception) -> bool:
+    """
+    Detect failures caused by the OPTIONAL reference-audio denoiser stack.
+    voxcpm imports the denoiser (zipenhancer -> modelscope -> funasr and its
+    small helpers addict/simplejson/...) lazily inside VoxCPM.__init__, so a
+    broken or missing piece of that chain (e.g. "No module named 'addict'")
+    must never take down the whole model load.
+    """
+    if isinstance(ex, (ImportError, ModuleNotFoundError)):
+        return True
+    msg = str(ex).lower()
+    markers = (
+        "zipenhancer",
+        "modelscope",
+        "funasr",
+        "addict",
+        "simplejson",
+        "sortedcontainers",
     )
     return any(marker in msg for marker in markers)
 
@@ -510,8 +557,33 @@ class KhmerTTSModelEngine:
             f"denoiser={self.load_denoiser} | optimize={self.optimize} | timesteps={self.inference_timesteps}"
         )
         try:
-            self._load_model_once(self.optimize)
-            return
+            try:
+                self._load_model_once(self.optimize)
+                return
+            except Exception as denoiser_ex:
+                # voxcpm imports its OPTIONAL reference-audio denoiser
+                # (zipenhancer -> modelscope -> funasr) lazily inside
+                # VoxCPM.__init__. If that chain is broken/missing in the
+                # image, the model load must be retried WITHOUT the denoiser
+                # instead of failing the job with e.g.
+                # "VoxCPM model failed to load: No module named 'addict'".
+                if self.load_denoiser and _looks_like_denoiser_import_error(denoiser_ex):
+                    logger.warning(
+                        f"Optional denoiser stack unavailable "
+                        f"({type(denoiser_ex).__name__}: {str(denoiser_ex)[:200]}). "
+                        "Retrying with the reference-audio denoiser DISABLED "
+                        "(VOXCPM_DENOISER=0 behaviour)..."
+                    )
+                    self.load_denoiser = False
+                    self._load_model_once(self.optimize)
+                    logger.warning(
+                        "VoxCPM loaded WITHOUT the reference-audio denoiser. "
+                        "Reference-audio noise suppression is unavailable; "
+                        "install modelscope+funasr+addict (Dockerfile Step 4) "
+                        "to enable VOXCPM_DENOISER=1."
+                    )
+                    return
+                raise
         except Exception as primary_ex:
             if not self.optimize or not _looks_like_compile_error(primary_ex):
                 self.model = None
